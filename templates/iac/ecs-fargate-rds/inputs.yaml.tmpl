@@ -1,0 +1,37 @@
+# inputs.yaml — variable contract for the ecs-fargate-rds skeleton.
+# This file is consumed by lib/render.sh to substitute placeholders inside
+# the skeleton when the framework runs `generate-iac`.
+#
+# Keep all values as flat top-level scalar strings. Numeric values must be
+# quoted. Do not introduce nested maps or lists here — the renderer requires
+# scalars.
+
+project_name: "{{project_name}}"
+region: "{{region}}"
+account_id: "{{account_id}}"
+
+# Container runtime
+container_name: "{{container_name}}"
+container_port: "{{container_port}}"
+health_check_path: "{{health_check_path}}"
+
+# RDS Postgres
+db_engine_version: "{{db_engine_version}}"
+db_name: "{{db_name}}"
+db_master_username: "{{db_master_username}}"
+
+# Optional public DNS — if empty, ALB will serve plain HTTP (dev only).
+domain_name: "{{domain_name}}"
+
+# Observability
+log_retention_days: "{{log_retention_days}}"
+
+# Optional add-ons. Set to "true" to deploy. Defaults to "false" — leaves in
+# live/<env>/{keycloak,alb-https}/ check this and skip themselves unless
+# explicitly opted in. The recommend step writes guidance into
+# 02_infra_options.md telling the operator which flags to flip.
+include_keycloak:  "{{include_keycloak}}"   # OIDC auth via Keycloak (Fargate sibling)
+include_alb_https: "{{include_alb_https}}"  # self-signed HTTPS for no-domain dev
+
+# Remote state — operator-controlled, lives outside this skeleton.
+state_bucket: "{{state_bucket}}"

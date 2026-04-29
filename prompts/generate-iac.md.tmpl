@@ -1,0 +1,81 @@
+You are filling in application-specific values in a pre-built Terragrunt +
+Terraform skeleton. The skeleton has already been copied and `{{vars}}` from
+`{{vars_yaml}}` have already been substituted by the framework. Your job is to
+finish the parts that depend on application context which the variable file
+cannot express by itself.
+
+## Inputs
+
+- Repository name: {{repo_name}}
+- Repository source (read-only): {{source_path}}
+- Repository overview (already generated): {{overview_path}}
+- Selected skeleton id: {{skeleton_id}}
+- Rendered IaC directory (writable): {{iac_dir}}
+- Project state file (read-only): {{state_yaml}}
+- Variable file used for skeleton render (read-only): {{vars_yaml}}
+- AWS region: {{region}}
+- Environment: {{env}}
+- **TODO list (your worklist):** {{todo_list_path}}
+  The framework already grep'd the rendered IaC for every `TODO(devops-ai)`
+  marker and wrote the complete list (path:line:text per line) to that
+  file. **It is exhaustive.** Use it as your full worklist; do not search
+  for more markers.
+
+## Task
+
+Fixed sequence — follow it literally. Do **NOT** explore the IaC tree,
+do not list directories, do not run `find` or recursive `grep`.
+
+1. `cat {{todo_list_path}}` — this gives you every file and line that
+   needs a fix, with the marker text. Count the lines: that is your N.
+2. `cat {{overview_path}}` — read it once, end-to-end, to get the env
+   vars, secret names, ports, db engine version.
+3. For each line in the TODO list, **in order**:
+     a. Read just that one file (use `text_editor view` on the file path
+        from column 1 of the TODO list).
+     b. Make the edit using `text_editor str_replace`. Replace the
+        `# TODO(devops-ai):` comment block with the resolved value.
+     c. Move to the next TODO. Do not re-explore; do not re-read overview.
+4. After all N edits: run `terragrunt hcl format --working-dir {{iac_dir}}/live`
+   once to canonicalize whitespace.
+5. Run `grep -rn 'TODO(devops-ai)' {{iac_dir}}` — confirm zero matches.
+6. Print a one-line summary per file you edited (e.g. "edited
+   _envcommon/secrets.hcl: replaced placeholder DATABASE_PASSWORD with
+   full secret list from overview"), then print the success marker on
+   its own line.
+
+## What goes in each TODO type
+
+- `_envcommon/secrets.hcl` `secret_keys = [...]` — list every secret name
+  from the overview's "Configuration" section that is marked sensitive
+  (passwords, tokens, client secrets). One key per line. Each becomes a
+  Secrets Manager entry named `{{repo_name}}/{{env}}/<KEY>` in
+  region `{{region}}`.
+- `_envcommon/ecs-service.hcl` `environment = [...]` — copy non-sensitive
+  env vars from the overview (DB_HOST, DB_PORT, REDIS_URL, API_PORT, etc.)
+  as `{ name = "...", value = "" }`. Use empty string for values the
+  operator must fill at deploy time.
+- `_envcommon/ecs-service.hcl` `secrets = [...]` — for every entry in
+  `secret_keys` above, add `{ name = "<KEY>", valueFrom =
+  lookup(dependency.secrets.outputs.secret_arns_by_key, "<KEY>", "") }`.
+- `_envcommon/alb.hcl` `certificate_arn = ""` — leave empty if
+  `domain_name` in inputs.yaml is empty (dev). Otherwise leave the
+  TODO and note in your summary that the operator must issue an ACM
+  cert and paste the ARN before `deploy-infra`.
+
+## Constraints
+
+- **Stay inside `{{iac_dir}}`.** Do not create files anywhere else
+  (not `~/Documents/`, not `/tmp/`, nowhere). The only writes you make
+  are `text_editor` calls against paths listed in `{{todo_list_path}}`.
+- Tool call budget: aim for **N + 5** total tool calls (cat the todo
+  list + cat overview + N edits + format + final verify grep). Do not
+  explore beyond that.
+- Output language for any new comments / doc: **English only**.
+- Never write real secret values into HCL. Always reference Secrets Manager.
+- Never invent module sources. If a feature needs a module not present in the
+  skeleton, stop and report the gap rather than hand-writing resources.
+- Do not run `apply`, `destroy`, or `plan -auto-approve`. Validation only.
+- If anything in the overview contradicts the skeleton (e.g. overview says
+  MySQL but skeleton wires Postgres), stop and report the conflict.
+- When done, print one line: `IAC READY {{iac_dir}}` and stop.

@@ -1,0 +1,124 @@
+# Goose recipe: build/push container image and update the runtime.
+# Source of truth for the prompt body: framework/prompts/deploy-app.md.tmpl
+version: "1.0.0"
+title: "Deploy application"
+description: "Docker build (linux/amd64), push to ECR, update ECS/EKS/Lambda, smoke test, log."
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name (matches projects/<name>/)."
+  - key: source_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to the repository source tree."
+  - key: region
+    input_type: string
+    requirement: required
+    description: "AWS region (e.g. us-east-1)."
+  - key: env
+    input_type: string
+    requirement: required
+    description: "Environment name: dev / stage / prod."
+  - key: outputs_path
+    input_type: string
+    requirement: required
+    description: "JSON with ecr_repo_url, ecs_cluster_name, etc. produced by deploy-infra."
+  - key: history_path
+    input_type: string
+    requirement: required
+    description: "Append-only deploy log (JSONL)."
+  - key: git_ref
+    input_type: string
+    requirement: optional
+    default: ""
+    description: "Optional branch/tag/SHA. If empty, build current HEAD."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are deploying an application to already-provisioned AWS infrastructure.
+  This step builds a container image, pushes it to ECR, updates the runtime
+  target (ECS service / EKS deployment / Lambda function — read the outputs
+  file to know which), and verifies health.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - Source code path: {{ source_path }}
+  - AWS region: {{ region }}
+  - Environment: {{ env }}
+  - Stack outputs (read-only): {{ outputs_path }}
+     This JSON contains identifiers like `ecr_repo_url`, `ecs_cluster_name`,
+     `ecs_service_name`, `alb_dns_name`, etc. Keys depend on the skeleton.
+  - Deploy history file (append-only): {{ history_path }}
+  - Git ref to build (optional): {{ git_ref }}
+     If empty, build from the current `HEAD` of `{{ source_path }}`.
+
+  ## Task
+
+  1. Resolve the deployable git SHA:
+     ```
+     cd {{ source_path }}
+     git fetch --all --quiet
+     git rev-parse HEAD          # or git rev-parse {{ git_ref }} if provided
+     ```
+     Use the **short** SHA (`git rev-parse --short=12 ...`) as the image tag.
+     If the working tree is dirty, append `-dirty` to the tag and warn the
+     operator.
+
+  2. Read `{{ outputs_path }}` and extract:
+     - `ecr_repo_url`
+     - `ecs_cluster_name`, `ecs_service_name`  (if ECS skeleton)
+     - `eks_cluster_name`, `k8s_namespace`, `k8s_deployment` (if EKS skeleton)
+     - `lambda_function_name` (if Lambda skeleton)
+     If the keys you need are missing, stop and report which ones.
+
+  3. Authenticate Docker to ECR:
+     ```
+     aws ecr get-login-password --region {{ region }} \
+       | docker login --username AWS --password-stdin <ecr_repo_url>
+     ```
+
+  4. Build for `linux/amd64` (do not rely on host arch):
+     ```
+     docker buildx build --platform linux/amd64 \
+       -t <ecr_repo_url>:<sha> \
+       -t <ecr_repo_url>:{{ env }} \
+       --push \
+       {{ source_path }}
+     ```
+
+  5. Update the runtime:
+     - **ECS**: register a new task-definition revision pointing at the new
+       image, then `aws ecs update-service --force-new-deployment` and wait
+       with `aws ecs wait services-stable`.
+     - **EKS**: `kubectl set image deployment/<deployment> <container>=<image>`
+       in the right namespace and `kubectl rollout status`.
+     - **Lambda**: `aws lambda update-function-code --image-uri <image>`
+       and `aws lambda wait function-updated`.
+
+  6. Smoke-test:
+     - If `alb_dns_name` is in outputs, `curl -fsS http(s)://<dns>/health`
+       (or `/` if `/health` 404s) and require HTTP 2xx.
+     - If Lambda, invoke once with a minimal payload and require a non-error
+       response.
+     - On failure, stop and report. Do not auto-rollback (that is a separate
+       command).
+
+  7. Append a JSON record to `{{ history_path }}` with at minimum:
+     ```json
+     {"ts":"<iso8601>","git_sha":"<sha>","image":"<ecr_repo_url>:<sha>",
+      "env":"{{ env }}","region":"{{ region }}","result":"success|failed",
+      "task_def_arn":"<arn-if-ecs>","details":"<short message>"}
+     ```
+
+  ## Constraints
+
+  - Output language: **English only**.
+  - Always build for `linux/amd64`.
+  - Never push the `latest` tag.
+  - Never deploy from a dirty working tree to `prod` without an explicit
+    confirmation from the operator.
+  - Do not modify the IaC.
+  - When done, print one line: `APP DEPLOYED image=<ecr_repo_url>:<sha>` and stop.

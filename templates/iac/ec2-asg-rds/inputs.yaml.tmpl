@@ -1,0 +1,24 @@
+# inputs.yaml — variable contract for the ec2-asg-rds skeleton.
+
+project_name: "{{project_name}}"
+region: "{{region}}"
+account_id: "{{account_id}}"
+
+# App-level
+app_port: "{{app_port}}"
+health_check_path: "{{health_check_path}}"
+artifact_bucket: "{{artifact_bucket}}"
+
+# RDS Postgres
+db_engine_version: "{{db_engine_version}}"
+db_name: "{{db_name}}"
+db_master_username: "{{db_master_username}}"
+
+# Optional public DNS
+domain_name: "{{domain_name}}"
+
+# Observability
+log_retention_days: "{{log_retention_days}}"
+
+# Remote state
+state_bucket: "{{state_bucket}}"

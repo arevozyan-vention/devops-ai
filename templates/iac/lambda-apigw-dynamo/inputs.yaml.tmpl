@@ -1,0 +1,21 @@
+# inputs.yaml — variable contract for the lambda-apigw-dynamo skeleton.
+
+project_name: "{{project_name}}"
+region: "{{region}}"
+account_id: "{{account_id}}"
+
+# Lambda
+function_handler: "{{function_handler}}"
+
+# DynamoDB
+dynamo_partition_key: "{{dynamo_partition_key}}"
+dynamo_sort_key: "{{dynamo_sort_key}}"
+
+# Optional public DNS (informational)
+domain_name: "{{domain_name}}"
+
+# Observability
+log_retention_days: "{{log_retention_days}}"
+
+# Remote state
+state_bucket: "{{state_bucket}}"

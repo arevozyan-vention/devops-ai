@@ -1,0 +1,67 @@
+# {{repo_name}} — Operator Runbook
+
+> Project-specific runbook generated at `select` time. Cross-references the
+> commands the framework exposes.
+
+| Field | Value |
+|---|---|
+| Project | `{{repo_name}}` |
+| Skeleton | `{{skeleton}}` |
+| Region | `{{region}}` |
+| Environment | `{{env}}` |
+| Source path | `{{source_path}}` |
+| IaC path | `projects/{{repo_name}}/iac/` |
+
+## Day-to-day
+
+### Plan + apply infrastructure changes
+```
+./devops-ai.sh deploy-infra {{repo_name}}
+```
+The framework runs `terragrunt run --all plan`, summarizes the diff, and waits
+for explicit approval before `apply`. For `env=prod`, approval requires
+typing `apply prod`.
+
+### Deploy a new application version
+```
+./devops-ai.sh deploy-app {{repo_name}}            # builds HEAD
+./devops-ai.sh deploy-app {{repo_name}} v1.2.0     # builds a specific ref
+```
+Builds a `linux/amd64` image, pushes to ECR, updates the runtime, smoke-tests
+the ALB target (or invokes the Lambda once), and writes a record to
+`projects/{{repo_name}}/deploy/history.jsonl`.
+
+### Stricter upgrade with prod gate
+```
+./devops-ai.sh upgrade {{repo_name}} v1.2.0
+```
+Same as `deploy-app`, but requires `apply prod` for prod and runs 5 successive
+HTTP 2xx smoke checks on `/health`.
+
+### Rollback to last known-good
+```
+./devops-ai.sh rollback {{repo_name}}
+```
+Looks up the most recent `result == success` entry in `history.jsonl`,
+points the runtime at that image, and verifies health. Does not rebuild.
+
+## Emergency
+
+### Stop a stuck deploy
+- ECS: `aws ecs update-service --force-new-deployment --desired-count 0`
+- Lambda: `aws lambda update-function-code --image-uri <previous>`
+- ASG: `aws autoscaling cancel-instance-refresh`
+
+### Lost AWS state
+- The Terragrunt state lives in S3 bucket `<state_bucket>` (see
+  `projects/{{repo_name}}/iac/inputs.yaml`).
+- S3 native lockfile (no DynamoDB needed). Stuck locks: `terragrunt force-unlock` or delete the lock object in S3.
+
+## Where things live
+
+- Source code: `{{source_path}}`
+- Generated docs: `projects/{{repo_name}}/docs/`
+- IaC: `projects/{{repo_name}}/iac/`
+- Deploy log: `projects/{{repo_name}}/deploy/history.jsonl`
+- Stack outputs: `projects/{{repo_name}}/deploy/outputs.json`
+- Workflow state: `projects/{{repo_name}}/state.yaml`

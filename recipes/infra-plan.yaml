@@ -1,0 +1,183 @@
+# Goose recipe: read-only Terragrunt plan + write a human-reviewable summary.
+# This recipe NEVER mutates AWS. The framework calls it first; after it
+# succeeds, framework/devops-ai.sh prints the summary, asks the operator for
+# explicit approval via bash `read`, and only then calls infra-apply.
+#
+# Source of truth for the prompt body: framework/prompts/infra-plan.md.tmpl
+version: "1.0.0"
+title: "Plan infrastructure"
+description: "Run terragrunt plan and write a Markdown plan summary derived strictly from terragrunt stdout."
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name (matches projects/<name>/)."
+  - key: iac_dir
+    input_type: string
+    requirement: required
+    description: "Path to the rendered Terragrunt project (projects/<repo>/iac/)."
+  - key: env
+    input_type: string
+    requirement: required
+    description: "Environment name: dev / stage / prod."
+  - key: region
+    input_type: string
+    requirement: required
+    description: "AWS region (e.g. us-east-1)."
+  - key: plan_summary_path
+    input_type: string
+    requirement: required
+    description: "Path to the Markdown file you must write with the plan summary."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are running a Terragrunt **plan** for AWS infrastructure. This recipe is
+  read-only: it must not apply or destroy anything. Your single deliverable is a
+  Markdown summary file at `{{ plan_summary_path }}`, derived **strictly from
+  the stdout of `terragrunt run --all plan`** that you executed in this session.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - IaC directory: {{ iac_dir }}
+  - Environment: {{ env }}             # dev | stage | prod
+  - AWS region: {{ region }}
+  - Plan summary file (write this): {{ plan_summary_path }}
+
+  ## Terragrunt 1.x (stargazer) CLI cheatsheet
+
+  The framework runs Terragrunt 1.x. Many legacy `--terragrunt-*` flags have
+  been renamed or removed. Use only what is below.
+
+  KNOWN-GOOD INVOCATIONS:
+  - `terragrunt run --all plan --non-interactive`
+  - `terragrunt run --all output --non-interactive`
+  - `terragrunt force-unlock <LOCK_ID>`        (positional id only — no `--force`)
+  - `terragrunt hcl format --working-dir <p>`  (replaces `hclfmt`)
+  - `terragrunt --working-dir <unit-dir> plan` (single-unit form)
+
+  PASSING TERRAFORM FLAGS:
+  Terraform-specific flags (`-out`, `-json`, `-lock=false`, `-refresh=false`)
+  MUST come after a literal `--` separator. Otherwise terragrunt rejects them.
+    GOOD: `terragrunt run --all output --non-interactive -- -json`
+    BAD:  `terragrunt run --all plan --non-interactive -out=foo`
+
+  FLAGS THAT NO LONGER EXIST (do not invent them):
+  - `--terragrunt-include-external-dependencies`
+  - `--terragrunt-non-interactive`     (just `--non-interactive`)
+  - `--terragrunt-parallelism`         (use `TG_PARALLELISM` env var; framework sets it)
+  - `--force` on `force-unlock`
+
+  IF YOU SEE `flag provided but not defined` or `is not a valid flag for ...`,
+  STOP. Re-read this cheatsheet. Do NOT retry the same command verbatim.
+
+  TIMEOUTS: init + plan across ~10 modules on a cold cache takes 5-15 minutes,
+  but local-model latency can stretch this further. Set `timeout_secs=6000` on
+  every shell call that runs terragrunt. If Goose rejects this value as too
+  large, fall back to `timeout_secs=3600` and report the rejection in your
+  next message — do not silently drop to a smaller number.
+
+  ## Task
+
+  1. Confirm AWS identity:
+     ```
+     aws sts get-caller-identity
+     ```
+     Note the account id and ARN. Include both at the top of the summary file.
+
+  2. `cd {{ iac_dir }}/live/{{ env }}` and run plan:
+     ```
+     terragrunt run --all plan --non-interactive
+     ```
+     Tee the output to a file under `/tmp` so you can grep it later instead of
+     re-running plan. Capture exit code.
+
+  3. Parse the plan stdout (NOT the source files) to extract per-unit
+     `Plan: N to add, M to change, K to destroy.` lines. The format is:
+       `[<unit>] terraform: Plan: N to add, M to change, K to destroy.`
+     Build the summary table from these lines and these lines only.
+
+  4. **Greenfield handling.** On a clean account some downstream units (most
+     commonly `ecs-service`) cannot be planned because their published Terraform
+     module uses `data "aws_subnet"` / `data "aws_security_group"` lookups that
+     query AWS for resources that do not yet exist. Symptoms:
+     - `Error: no matching EC2 Subnet found`
+     - `Error: no matching EC2 Security Group found`
+     - errors referencing `data.aws_subnet`, `data.aws_security_group`, etc.
+     This is **not** an IaC bug. List those units in the summary under a
+     "Deferred to apply" section and continue. They will plan/apply correctly
+     during the apply phase, after their dependencies are created.
+
+  5. **Real failures still stop you.** If a unit fails for any other reason
+     (HCL syntax, missing module, IAM permission denied, S3 backend error,
+     stale state lock that you could not clear, etc.), do NOT produce a success
+     marker. Write `## Plan failed` at the top of the summary file with the
+     verbatim error and stop.
+
+  6. Write `{{ plan_summary_path }}` with this structure (Markdown):
+
+     ```
+     # Plan summary — {{ repo_name }} / {{ env }} / {{ region }}
+
+     - AWS account: <account>
+     - AWS ARN:     <arn>
+     - Generated:   <ISO8601 UTC timestamp>
+
+     ## Per-unit plan
+     | Unit | + add | ~ change | - destroy |
+     |------|-------|----------|-----------|
+     | vpc  |   19  |    0     |    0      |
+     | ...  |       |          |           |
+
+     ## Totals
+     - To add:     <sum>
+     - To change:  <sum>
+     - To destroy: <sum>
+
+     ## Notable changes
+     - Any destroys (highlight loudly, especially for prod)
+     - Any IAM, security group, or public-internet exposure changes
+     - Any RDS / data-store changes (replacements, version bumps)
+
+     ## Deferred to apply
+     <units that legitimately could not plan on greenfield, with the exact error type>
+
+     ## Plan stdout (truncated)
+     <last ~50 lines of plan stdout, for traceability>
+     ```
+
+  7. Print exactly one final line and stop:
+     ```
+     PLAN READY plan_summary={{ plan_summary_path }}
+     ```
+
+  ## Constraints
+
+  - **Anti-hallucination — read carefully.** You are forbidden from filling
+    the plan summary using anything other than real `terragrunt plan` stdout
+    captured in this session. Specifically:
+      - Do NOT read `.hcl`, `.tf`, `.tfvars`, `inputs.yaml`, or `env.hcl` to
+        infer "what would be planned".
+      - Do NOT generate counts, resource lists, ports, engines, or sizes from
+        memory or by reading source files.
+      - Do NOT write a Plan Summary if `terragrunt run --all plan` did not
+        execute and produce output in this session.
+      - If you find yourself listing resources that do not appear in the plan
+        stdout file, STOP. That is hallucination.
+    The summary's "Per-unit plan" rows MUST come from `Plan:` lines in the
+    captured stdout. If a unit produced no `Plan:` line, list it under
+    "Deferred to apply" with the verbatim error excerpt — do not estimate.
+
+  - **No mutations.** Do not run `apply`, `destroy`, `import`, `state rm`,
+    `taint`, or any command that changes AWS or terraform state. The only
+    state-touching command allowed is `terragrunt force-unlock <id>` to clear
+    a clearly stale lock owned by this same machine.
+
+  - Output language: **English only**.
+
+  - If plan succeeds (or finishes with only "Deferred to apply" units), print
+    `PLAN READY plan_summary={{ plan_summary_path }}` and stop.
+
+  - If plan fails for any other reason, do NOT print `PLAN READY`. Write the
+    failure to the summary file with the verbatim error and stop.

@@ -1,0 +1,22 @@
+# inputs.yaml — variable contract for the eks-rds skeleton.
+
+project_name: "{{project_name}}"
+region: "{{region}}"
+account_id: "{{account_id}}"
+
+cluster_version: "{{cluster_version}}"
+
+# Service account / namespace for the app. Used by IRSA.
+app_namespace: "{{app_namespace}}"
+app_service_account: "{{app_service_account}}"
+
+# RDS Postgres
+db_engine_version: "{{db_engine_version}}"
+db_name: "{{db_name}}"
+db_master_username: "{{db_master_username}}"
+
+# Optional public DNS — informational, not wired in this skeleton.
+domain_name: "{{domain_name}}"
+
+# Remote state — operator-controlled.
+state_bucket: "{{state_bucket}}"
