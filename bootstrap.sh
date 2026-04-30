@@ -4,7 +4,8 @@
 
 set -euo pipefail
 
-readonly REQUIRED_MODEL="qwen3.6:35b-a3b"
+readonly REQUIRED_MODEL="claude-opus-4-7"
+readonly GOOSE_PROVIDER_NAME="claude-acp"
 readonly FRAMEWORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEVOPS_AI_ROOT="$(cd "$FRAMEWORK_DIR/.." && pwd)"
 
@@ -78,48 +79,69 @@ ensure_goose() {
   ok "goose installed"
 }
 
-ensure_ollama_running() {
-  if curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
-    ok "ollama daemon reachable at http://localhost:11434"
+ensure_node() {
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    ok "node found ($(node --version)), npm found ($(npm --version))"
     return
   fi
-  warn "ollama daemon not running"
-  if [[ -d "/Applications/Ollama.app" ]]; then
-    step "Starting Ollama.app"
-    open -a Ollama
-    for _ in {1..10}; do
-      sleep 1
-      curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 && break
-    done
-  fi
-  curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1 \
-    || die "ollama still not reachable. Start it manually: 'open -a Ollama' or 'ollama serve'"
-  ok "ollama daemon reachable"
+  step "Installing node (provides npm for claude CLI + ACP adapter)"
+  brew install node
+  ok "node installed"
 }
 
-ensure_model() {
-  step "Checking model $REQUIRED_MODEL"
-  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$REQUIRED_MODEL"; then
-    ok "model already present"
-  else
-    step "Pulling $REQUIRED_MODEL (this may take a while; ~23 GB)"
-    ollama pull "$REQUIRED_MODEL"
-    ok "model pulled"
+ensure_claude_cli() {
+  if command -v claude >/dev/null 2>&1; then
+    ok "claude CLI found ($(claude --version 2>&1 | head -n1))"
+    return
   fi
+  step "Installing @anthropic-ai/claude-code"
+  npm install -g @anthropic-ai/claude-code
+  command -v claude >/dev/null 2>&1 \
+    || die "claude not on PATH after install. Check 'npm prefix -g'/PATH."
+  ok "claude CLI installed"
+}
+
+ensure_claude_acp() {
+  if command -v claude-agent-acp >/dev/null 2>&1; then
+    ok "claude-agent-acp adapter found"
+    return
+  fi
+  step "Installing @agentclientprotocol/claude-agent-acp"
+  npm install -g @agentclientprotocol/claude-agent-acp
+  command -v claude-agent-acp >/dev/null 2>&1 \
+    || die "claude-agent-acp not on PATH after install."
+  ok "ACP adapter installed"
+}
+
+ensure_claude_authenticated() {
+  step "Verifying claude CLI is authenticated to a Claude subscription"
+  if claude --print --model "$REQUIRED_MODEL" "reply OK" >/dev/null 2>&1; then
+    ok "claude CLI authenticated and $REQUIRED_MODEL reachable"
+    return
+  fi
+  warn "claude CLI not authenticated (or model unreachable)"
+  echo "  Run interactively:  claude   (then complete OAuth login under your Max plan)"
+  die "claude CLI authentication required"
 }
 
 ensure_goose_config() {
   local cfg="$HOME/.config/goose/config.yaml"
-  step "Configuring Goose for local Ollama"
+  step "Configuring Goose for $GOOSE_PROVIDER_NAME ($REQUIRED_MODEL)"
   mkdir -p "$(dirname "$cfg")"
-  if [[ -f "$cfg" ]] && grep -q "GOOSE_PROVIDER" "$cfg" 2>/dev/null; then
-    ok "Goose config already present at $cfg (left untouched)"
-    return
+  # If a previous (qwen/ollama) config exists, preserve it as .qwen.bak so we
+  # can A/B compare. Idempotent: only overwrite if provider isn't already claude-acp.
+  if [[ -f "$cfg" ]]; then
+    if grep -q "^GOOSE_PROVIDER: $GOOSE_PROVIDER_NAME" "$cfg" 2>/dev/null; then
+      ok "Goose already configured for $GOOSE_PROVIDER_NAME (left untouched)"
+      return
+    fi
+    cp "$cfg" "$cfg.qwen.bak"
+    ok "Backed up previous Goose config to $cfg.qwen.bak"
   fi
   cat > "$cfg" <<EOF
-GOOSE_PROVIDER: ollama
+GOOSE_PROVIDER: $GOOSE_PROVIDER_NAME
 GOOSE_MODEL: $REQUIRED_MODEL
-OLLAMA_HOST: http://localhost:11434
+GOOSE_MODE: smart_approve
 extensions:
   developer:
     enabled: true
@@ -154,11 +176,13 @@ main() {
   ensure_brew_pkg terraform
   ensure_terragrunt
   ensure_brew_pkg docker
-  ensure_brew_pkg ollama
+
+  ensure_node
+  ensure_claude_cli
+  ensure_claude_acp
+  ensure_claude_authenticated
 
   ensure_goose
-  ensure_ollama_running
-  ensure_model
   ensure_goose_config
   make_scripts_executable
 

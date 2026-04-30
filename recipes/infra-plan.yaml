@@ -7,6 +7,11 @@
 version: "1.0.0"
 title: "Plan infrastructure"
 description: "Run terragrunt plan and write a Markdown plan summary derived strictly from terragrunt stdout."
+# Tuned for Opus 4.7. Low temp because the summary must echo terragrunt
+# output truthfully (no hallucination of resource counts). max_turns wide
+# enough to handle 11+ unit run-all + retry of any flaky init step.
+temperature: 0.2
+max_turns: 60
 parameters:
   - key: repo_name
     input_type: string

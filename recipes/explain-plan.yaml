@@ -1,0 +1,90 @@
+# Goose recipe: turn a terragrunt plan summary into a risk/cost narrative.
+# Runs AFTER plan-infra and BEFORE apply-infra. The framework's plan_summary
+# is just resource counts; this adds risk, cost-delta, blast-radius, and
+# reversibility — what a human reviewer actually needs to gate apply.
+version: "1.0.0"
+title: "Explain plan"
+description: "Risk/cost/blast-radius narrative on top of plan_summary.md."
+temperature: 0.3
+max_turns: 50
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name."
+  - key: plan_summary_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to deploy/plan_summary.md."
+  - key: output_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to docs/06_plan_review.md to write."
+  - key: state_yaml
+    input_type: string
+    requirement: required
+    description: "Absolute path to the project's state.yaml."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are a senior SRE explaining a terragrunt plan to an operator who
+  is about to run `terragrunt apply`. The bare counts in {{ plan_summary_path }}
+  don't tell them what's actually risky.
+
+  ## Inputs
+
+  - Plan summary: {{ plan_summary_path }}
+  - Project state: {{ state_yaml }}
+  - Report output: {{ output_path }}
+
+  ## Goal
+
+  Make the apply decision easy. The `aws-api` MCP is enabled — feel
+  free to query current AWS state to compare against the plan.
+
+  ## Required output structure ({{ output_path }}, Markdown)
+
+  ```
+  # Plan Review — {{ repo_name }}
+
+  ## TL;DR
+  One sentence: what this apply does and what its biggest risk is.
+
+  ## Resource summary
+  - Total to add / change / destroy (echo from plan_summary)
+
+  ## High-risk changes
+  For each: what changes, why it's risky, what to watch for during apply,
+  estimated time to complete that unit.
+  - RDS recreation (data loss potential)
+  - IAM policy widening (privilege escalation potential)
+  - Security group opening 0.0.0.0/0 (public exposure)
+  - Resources marked `prevent_destroy=false` that look load-bearing
+
+  ## Cost delta
+  Estimated monthly cost delta from this apply. Itemise the biggest
+  contributors.
+
+  ## Blast radius
+  Which user-facing components will be affected during apply (downtime,
+  cold starts, DNS propagation, certificate revalidation).
+
+  ## Reversibility
+  - Resources you can `apply` back to previous state safely
+  - Resources where rollback requires data restoration / DNS work
+  - Resources where rollback is impossible without outage
+
+  ## Pre-flight checklist
+  - [ ] backups taken
+  - [ ] domain DNS TTL lowered (if cert/ALB changing)
+  - [ ] feature flags ready
+  - [ ] etc — based on what this plan actually does
+  ```
+
+  ## Constraints
+
+  - English only.
+  - Numbers must come from the plan summary or the live AWS API. No
+    hand-waved estimates.
+  - When done, print one line: `WROTE {{ output_path }}` and stop.

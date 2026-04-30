@@ -54,10 +54,12 @@ require_docker_running() {
   return 0
 }
 
-require_ollama_running() {
-  if ! curl -fsS --max-time 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
-    echo "validators.sh: Ollama daemon not reachable at http://localhost:11434" >&2
-    echo "  Start it with: open -a Ollama   (or: ollama serve)" >&2
+require_claude_authenticated() {
+  require_command claude "npm i -g @anthropic-ai/claude-code" || return 1
+  require_command claude-agent-acp "npm i -g @agentclientprotocol/claude-agent-acp" || return 1
+  if ! claude --print --model "${REQUIRED_MODEL:-claude-opus-4-7}" "ok" >/dev/null 2>&1; then
+    echo "validators.sh: claude CLI not authenticated (or model unreachable)" >&2
+    echo "  Run: claude   (interactive OAuth login under your Claude Max plan)" >&2
     return 1
   fi
   return 0
@@ -110,21 +112,21 @@ require_iac_rendered() {
 preflight_analyze() {
   local repo="$1"
   require_project "$repo"
-  require_ollama_running
+  require_claude_authenticated
   require_goose
 }
 
 preflight_recommend() {
   local repo="$1"
   require_project "$repo"
-  require_ollama_running
+  require_claude_authenticated
   require_goose
 }
 
 preflight_generate_iac() {
   local repo="$1"
   require_project "$repo"
-  require_ollama_running
+  require_claude_authenticated
   require_goose
   require_terraform_stack
 }
@@ -148,5 +150,24 @@ preflight_deploy_app() {
 preflight_rollback() {
   local repo="$1"
   require_project "$repo"
+  require_aws_creds
+}
+
+# New Opus 4.7-tuned recipes:
+# - explain-plan reads plan_summary.md, may call aws-api MCP, no IaC mutations
+# - audit walks IaC + queries live AWS via aws-api MCP, no mutations
+preflight_explain_plan() {
+  local repo="$1"
+  require_project "$repo"
+  require_claude_authenticated
+  require_goose
+  require_aws_creds
+}
+
+preflight_audit() {
+  local repo="$1"
+  require_project "$repo"
+  require_claude_authenticated
+  require_goose
   require_aws_creds
 }

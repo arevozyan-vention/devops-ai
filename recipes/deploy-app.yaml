@@ -3,6 +3,9 @@
 version: "1.0.0"
 title: "Deploy application"
 description: "Docker build (linux/amd64), push to ECR, update ECS/EKS/Lambda, smoke test, log."
+# Tuned for Opus 4.7. Low temp — fixed-order operational steps.
+temperature: 0.1
+max_turns: 60
 parameters:
   - key: repo_name
     input_type: string
@@ -121,4 +124,12 @@ prompt: |
   - Never deploy from a dirty working tree to `prod` without an explicit
     confirmation from the operator.
   - Do not modify the IaC.
+  - **Before** the final success marker, print a `## Access summary` block
+    that the operator can use immediately:
+    - **Application URL**:    `http://<alb_dns_name from outputs>/`
+    - **Health check**:       `http://<alb_dns_name>/api/v1/health`
+    - **Image deployed**:     `<ecr_repo_url>:<sha>`
+    - **Smoke test result**:  pass | fail (and HTTP status code observed)
+    - **Logs**:               `aws logs tail <log_group_name> --since 5m`
+    Pull values from outputs.json; omit lines whose value is empty.
   - When done, print one line: `APP DEPLOYED image=<ecr_repo_url>:<sha>` and stop.

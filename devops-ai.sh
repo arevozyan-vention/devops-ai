@@ -53,7 +53,14 @@ ensure_param() {
 # Format: space-separated "name:true" / "name:false" pairs.
 _recipe_mcp_plan() {
   case "$1" in
-    analyze|recommend)             echo "aws-api:false terraform:false" ;;
+    # analyze/recommend now run with aws-api ON so Opus 4.7 can ground its
+    # suggestions in the user's actual AWS account state (existing VPC, IAM,
+    # quotas, prior deploys). terraform MCP gives access to live registry
+    # docs for accurate provider versioning.
+    analyze|recommend|assess)      echo "aws-api:true  terraform:true"  ;;
+    review-iac)                    echo "aws-api:true  terraform:true"  ;;
+    audit)                         echo "aws-api:true  terraform:true"  ;;
+    explain-plan)                  echo "aws-api:true  terraform:false" ;;
     generate-iac)                  echo "aws-api:false terraform:true"  ;;
     infra-plan|infra-apply)        echo "aws-api:true  terraform:true"  ;;
     deploy-app|upgrade|rollback)   echo "aws-api:true  terraform:false" ;;
@@ -174,7 +181,11 @@ run_recipe() {
   local args=()
   for kv in "$@"; do args+=(--params "$kv"); done
 
-  local max_attempts="${RECIPE_MAX_ATTEMPTS:-3}"
+  # Default attempts=1 since we run on Claude Opus 4.7 which gets it right
+  # the first time; retries only mask real environment problems (Gatekeeper,
+  # missing AWS resources, wrong creds). Override with RECIPE_MAX_ATTEMPTS=N
+  # for debugging.
+  local max_attempts="${RECIPE_MAX_ATTEMPTS:-1}"
   local attempt=1 logfile rc
   logfile="$(mktemp -t devops-ai-recipe.XXXXXX)"
 
@@ -222,18 +233,24 @@ Workflow commands:
   init <repo-path>             Register a project. Creates projects/<name>/.
   analyze <repo>               Read source → docs/01_overview.md (English).
   recommend <repo>             Pick 2–3 IaC skeletons → docs/02_infra_options.md.
+  assess <repo>                analyze + recommend in one Opus 4.7 session
+                               (faster, lower token cost on 1M-context models).
   select <repo> <opts>         Lock a choice (skeleton, region, env, optional extensions).
                                Required: --skeleton, --region, --env
                                Optional: --account-id, --include <csv>
                                --include accepts a comma list of opt-in extensions
                                          (ecs-fargate-rds: keycloak, alb-https).
   generate-iac <repo>          Render skeleton + AI completes TODO markers.
+  review-iac <repo>            Self-review of generated IaC (security/cost/policy)
+                               → docs/03_review.md. Run BEFORE plan-infra.
   aws-login                    Helper around 'aws configure sso'.
   aws-bootstrap [<repo>]       Create the S3 tfstate bucket. Without args:
                                creates 'devops-ai-tfstate-<account>'. With
                                <repo>: reads bucket name from its inputs.yaml.
   plan-infra <repo>            terragrunt run --all plan only. Writes a
                                human-reviewable plan_summary.md. No AWS mutation.
+  explain-plan <repo>          Risk/cost/blast-radius narrative on top of
+                               plan_summary.md → docs/06_plan_review.md.
   apply-infra <repo>           Reads existing plan_summary.md, asks for explicit
                                approval, runs terragrunt apply.
   deploy-infra <repo>          plan + approve + apply in one shot (combines
@@ -247,10 +264,14 @@ Inspection:
   status [<repo>]              Show project state (or list all projects).
   list                         List initialized projects.
   catalog                      List available IaC skeletons + their READMEs.
+  audit <repo>                 Drift / posture check vs deployed AWS state
+                               → docs/07_audit.md. Run periodically.
 
 Each step gates on prior state. The command flow is roughly:
-  init → analyze → recommend → select → generate-iac → deploy-infra
-                                          → deploy-app → upgrade / rollback
+  init → analyze → recommend → select → generate-iac → review-iac
+       → plan-infra → explain-plan → apply-infra → deploy-app
+                                                  → upgrade / rollback / audit
+  Or shortcut: init → assess → select → generate-iac → ...
 EOF
 }
 
@@ -767,6 +788,154 @@ cmd_plan_infra() {
   ok "next: ./devops-ai.sh apply-infra $repo"
 }
 
+# assess — combined analyze + recommend in one Goose session.
+# Designed for Opus 4.7's 1M context: it can hold the full repo and the
+# skeleton catalogue at once, so we save the round-trip cost of running
+# analyze and recommend separately. Writes both 01_overview.md and
+# 02_infra_options.md in one shot, then flips analyzed+recommended.
+cmd_assess() {
+  local repo="${1:-}"; ensure_param "<repo>" "$repo"
+  preflight_recommend "$repo"
+  local source_path
+  source_path="$(state_get "$repo" source_path)"
+  local docs; docs="$(project_docs "$repo")"
+  local overview_path="$docs/01_overview.md"
+  local options_path="$docs/02_infra_options.md"
+  local templates_dir="$FRAMEWORK_DIR/templates/iac"
+  local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
+
+  run_recipe assess "WROTE ${options_path}" \
+    "repo_name=$repo" \
+    "source_path=$source_path" \
+    "templates_dir=$templates_dir" \
+    "overview_path=$overview_path" \
+    "options_path=$options_path" \
+    "state_yaml=$state_yaml"
+
+  [[ -s "$overview_path" ]] || die "assess: overview not produced at $overview_path"
+  [[ -s "$options_path" ]]  || die "assess: options not produced at $options_path"
+  state_set_bool "$repo" status.analyzed true
+  state_set_bool "$repo" status.recommended true
+  ok "overview → $overview_path"
+  ok "options  → $options_path"
+  ok "next: ./devops-ai.sh select $repo --skeleton <id> --region <r> --env <e>"
+}
+
+# review-iac — Opus self-reviews freshly generated IaC for security, cost,
+# correctness, and policy issues BEFORE plan-infra. Writes 03_review.md;
+# does not block plan-infra automatically — operator decides.
+cmd_review_iac() {
+  local repo="${1:-}"; ensure_param "<repo>" "$repo"
+  preflight_generate_iac "$repo"
+  state_check "$repo" iac_generated
+  local iac_dir; iac_dir="$(project_iac "$repo")"
+  local docs; docs="$(project_docs "$repo")"
+  local overview_path="$docs/01_overview.md"
+  local out_path="$docs/03_review.md"
+  local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
+
+  run_recipe review-iac "WROTE ${out_path}" \
+    "repo_name=$repo" \
+    "iac_dir=$iac_dir" \
+    "overview_path=$overview_path" \
+    "output_path=$out_path" \
+    "state_yaml=$state_yaml"
+
+  [[ -s "$out_path" ]] || die "review-iac: $out_path empty"
+  ok "review → $out_path"
+}
+
+# explain-plan — read deploy/plan_summary.md plus terragrunt outputs and
+# write a risk/cost/blast-radius narrative for human review prior to apply.
+cmd_explain_plan() {
+  local repo="${1:-}"; ensure_param "<repo>" "$repo"
+  preflight_explain_plan "$repo"
+  state_check "$repo" iac_generated
+  local deploy_dir; deploy_dir="$(project_dep "$repo")"
+  local plan_summary_path="$deploy_dir/plan_summary.md"
+  [[ -s "$plan_summary_path" ]] || die "explain-plan: $plan_summary_path missing — run plan-infra first"
+  local docs; docs="$(project_docs "$repo")"
+  local out_path="$docs/06_plan_review.md"
+  local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
+
+  run_recipe explain-plan "WROTE ${out_path}" \
+    "repo_name=$repo" \
+    "plan_summary_path=$plan_summary_path" \
+    "output_path=$out_path" \
+    "state_yaml=$state_yaml"
+
+  [[ -s "$out_path" ]] || die "explain-plan: $out_path empty"
+  ok "plan review → $out_path"
+}
+
+# audit — drift / posture check against deployed AWS resources. Reads
+# state.yaml + outputs.json + queries AWS via aws-api MCP, flags drift,
+# unused resources, security drift, missing tags. Run periodically.
+cmd_audit() {
+  local repo="${1:-}"; ensure_param "<repo>" "$repo"
+  preflight_audit "$repo"
+  state_check "$repo" iac_generated
+  local deploy_dir; deploy_dir="$(project_dep "$repo")"
+  local outputs_path="$deploy_dir/outputs.json"
+  local docs; docs="$(project_docs "$repo")"
+  local out_path="$docs/07_audit.md"
+  local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
+  local iac_dir; iac_dir="$(project_iac "$repo")"
+
+  run_recipe audit "WROTE ${out_path}" \
+    "repo_name=$repo" \
+    "iac_dir=$iac_dir" \
+    "outputs_path=$outputs_path" \
+    "output_path=$out_path" \
+    "state_yaml=$state_yaml"
+
+  [[ -s "$out_path" ]] || die "audit: $out_path empty"
+  ok "audit → $out_path"
+}
+
+# Print a human-readable access summary from outputs.json — ALB DNS,
+# RDS endpoint, ECS cluster/service, Keycloak path, ECR repo. Best-effort
+# (silent if outputs.json is missing or jq is not available).
+_print_access_summary() {
+  local repo="$1" stage="${2:-infra}"
+  local outputs_path; outputs_path="$(project_dep "$repo")/outputs.json"
+  [[ -s "$outputs_path" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local region env
+  region="$(state_get "$repo" region 2>/dev/null || echo "")"
+  env="$(state_get "$repo" env 2>/dev/null || echo "")"
+
+  local alb rds cluster service ecr kc_path
+  alb="$(jq -r '.dns_name.value // empty' "$outputs_path" 2>/dev/null)"
+  rds="$(jq -r '.db_instance_endpoint.value // empty' "$outputs_path" 2>/dev/null)"
+  cluster="$(jq -r '.cluster_name.value // empty' "$outputs_path" 2>/dev/null)"
+  service="$(jq -r '.service_name.value // empty' "$outputs_path" 2>/dev/null)"
+  ecr="$(jq -r '.repository_url.value // empty' "$outputs_path" 2>/dev/null)"
+  kc_path="$(jq -r '.url_path.value // empty' "$outputs_path" 2>/dev/null)"
+
+  echo
+  c_blue "═══ Access summary — $repo / $env / $region ═══"
+  if [[ -n "$alb" ]]; then
+    echo "  Application URL:       http://$alb/"
+    echo "  Health check:          http://$alb/api/v1/health"
+    [[ -n "$kc_path" && "$kc_path" != "null" ]] \
+      && echo "  Keycloak admin:        http://$alb${kc_path}/"
+  fi
+  [[ -n "$rds"     ]] && echo "  RDS endpoint:          $rds"
+  [[ -n "$cluster" ]] && echo "  ECS cluster:           $cluster"
+  [[ -n "$service" ]] && echo "  ECS service:           $service"
+  [[ -n "$ecr"     ]] && echo "  ECR repository:        $ecr"
+  echo
+  if [[ "$stage" == "infra" ]]; then
+    c_yellow "  Infra is up but the app image hasn't been deployed yet."
+    c_yellow "  Next: ./devops-ai.sh deploy-app $repo"
+  elif [[ "$stage" == "app" ]]; then
+    c_green "  App deployed. Smoke test:  curl -i http://$alb/api/v1/health"
+  fi
+  echo
+}
+
 cmd_apply_infra() {
   local repo="${1:-}"; ensure_param "<repo>" "$repo"
   local region env iac_dir plan_summary_path outputs_path
@@ -775,6 +944,7 @@ cmd_apply_infra() {
   step "Apply only — using existing plan summary"
   _infra_phase_gate_and_apply "$repo" "$iac_dir" "$env" "$region" \
     "$plan_summary_path" "$outputs_path"
+  _print_access_summary "$repo" infra
 }
 
 cmd_deploy_infra() {
@@ -787,6 +957,7 @@ cmd_deploy_infra() {
   step "Phase 2/2 — human approval + apply"
   _infra_phase_gate_and_apply "$repo" "$iac_dir" "$env" "$region" \
     "$plan_summary_path" "$outputs_path"
+  _print_access_summary "$repo" infra
 }
 
 cmd_deploy_app() {
@@ -815,6 +986,7 @@ cmd_deploy_app() {
 
   state_set_bool "$repo" status.app_deployed true
   ok "deploy-app finished; check $history_path for the record"
+  _print_access_summary "$repo" app
 }
 
 cmd_upgrade() {
@@ -935,8 +1107,12 @@ main() {
     init)                  cmd_init "$@" ;;
     analyze)               cmd_analyze "$@" ;;
     recommend)             cmd_recommend "$@" ;;
+    assess)                cmd_assess "$@" ;;
     select)                cmd_select "$@" ;;
     generate-iac)          cmd_generate_iac "$@" ;;
+    review-iac)            cmd_review_iac "$@" ;;
+    explain-plan)          cmd_explain_plan "$@" ;;
+    audit)                 cmd_audit "$@" ;;
     aws-login)             cmd_aws_login "$@" ;;
     aws-bootstrap)         cmd_aws_bootstrap "$@" ;;
     plan-infra)            cmd_plan_infra "$@" ;;

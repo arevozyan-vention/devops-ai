@@ -3,6 +3,9 @@
 version: "1.0.0"
 title: "Rollback application"
 description: "Switch the runtime back to the most recent successful image. No rebuild."
+# Tuned for Opus 4.7. Zero temp — rollback is a strict, reversible action.
+temperature: 0.0
+max_turns: 40
 parameters:
   - key: repo_name
     input_type: string

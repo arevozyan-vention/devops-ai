@@ -15,34 +15,46 @@ cannot express by itself.
 - Variable file used for skeleton render (read-only): {{vars_yaml}}
 - AWS region: {{region}}
 - Environment: {{env}}
-- **TODO list (your worklist):** {{todo_list_path}}
-  The framework already grep'd the rendered IaC for every `TODO(devops-ai)`
-  marker and wrote the complete list (path:line:text per line) to that
-  file. **It is exhaustive.** Use it as your full worklist; do not search
-  for more markers.
+- **TODO worklist (advisory):** {{todo_list_path}}
+  The framework grep'd `TODO(devops-ai)` markers across the rendered
+  IaC tree as a starting hint. You are NOT required to use this list —
+  if you find more markers by looking yourself, resolve those too. If a
+  marker has been resolved before reaching it, that's fine.
 
 ## Task
 
-Fixed sequence — follow it literally. Do **NOT** explore the IaC tree,
-do not list directories, do not run `find` or recursive `grep`.
+**Goal:** make `{{iac_dir}}` ready for `terragrunt run-all plan` against
+AWS account in {{region}}/{{env}}. Concretely: every `TODO(devops-ai)`
+marker must be resolved with values that are correct for *this*
+application (not generic placeholders), the IaC must be `terragrunt hcl
+format`-clean, and any resolved value should be traceable back to either
+the repository overview, the inputs.yaml, or live AWS state queryable
+via the `terraform` MCP.
 
-1. `cat {{todo_list_path}}` — this gives you every file and line that
-   needs a fix, with the marker text. Count the lines: that is your N.
-2. `cat {{overview_path}}` — read it once, end-to-end, to get the env
-   vars, secret names, ports, db engine version.
-3. For each line in the TODO list, **in order**:
-     a. Read just that one file (use `text_editor view` on the file path
-        from column 1 of the TODO list).
-     b. Make the edit using `text_editor str_replace`. Replace the
-        `# TODO(devops-ai):` comment block with the resolved value.
-     c. Move to the next TODO. Do not re-explore; do not re-read overview.
-4. After all N edits: run `terragrunt hcl format --working-dir {{iac_dir}}/live`
-   once to canonicalize whitespace.
-5. Run `grep -rn 'TODO(devops-ai)' {{iac_dir}}` — confirm zero matches.
-6. Print a one-line summary per file you edited (e.g. "edited
-   _envcommon/secrets.hcl: replaced placeholder DATABASE_PASSWORD with
-   full secret list from overview"), then print the success marker on
-   its own line.
+You have a 1M-token context, the `text_editor` tool for reading and
+writing files, and the `terraform` MCP for live registry/module docs.
+The `developer` extension lets you run grep/find/terragrunt/etc. as
+needed. Use them however you see fit. Suggested approach (not
+mandatory):
+
+1. Read the overview ({{overview_path}}) and inputs.yaml ({{vars_yaml}})
+   so you have the application facts in working memory.
+2. Inspect the IaC tree at {{iac_dir}} — note the structure of `live/`
+   (per-env terragrunt configs) vs `_envcommon/` (shared), and which
+   units are wired together via `dependency` blocks.
+3. Find every `TODO(devops-ai)` marker (the framework's prep file
+   {{todo_list_path}} is a starting list; verify it's still complete).
+4. For each marker, read enough surrounding context (the whole file,
+   neighbouring units it depends on) to make a correct, internally
+   consistent resolution — not a syntactic str_replace.
+5. Apply the edits via `text_editor str_replace` (or `text_editor write`
+   when restructuring blocks).
+6. Run `terragrunt hcl format --working-dir {{iac_dir}}/live` once.
+7. Verify: `grep -rn 'TODO(devops-ai)' {{iac_dir}}` should return zero
+   results in real HCL/TF files (false-positives in the worklist
+   tracking file are fine — explicitly note them).
+8. Brief summary: one line per file you edited explaining WHY (not
+   just what), then the success marker on its own line.
 
 ## What goes in each TODO type
 
@@ -65,12 +77,12 @@ do not list directories, do not run `find` or recursive `grep`.
 
 ## Constraints
 
-- **Stay inside `{{iac_dir}}`.** Do not create files anywhere else
-  (not `~/Documents/`, not `/tmp/`, nowhere). The only writes you make
-  are `text_editor` calls against paths listed in `{{todo_list_path}}`.
-- Tool call budget: aim for **N + 5** total tool calls (cat the todo
-  list + cat overview + N edits + format + final verify grep). Do not
-  explore beyond that.
+- **Stay inside `{{iac_dir}}`** for writes. The only places you may
+  write are files inside that directory. Reading the source repo and
+  overview is fine and encouraged.
+- Use as many tool calls as you need to be correct — Opus 4.7 has
+  ample context, and a wrong IaC value caught at apply costs more than
+  five extra reads now.
 - Output language for any new comments / doc: **English only**.
 - Never write real secret values into HCL. Always reference Secrets Manager.
 - Never invent module sources. If a feature needs a module not present in the

@@ -1,0 +1,55 @@
+You are a senior SRE explaining a terragrunt plan to an operator who is
+about to run `terragrunt apply`. The bare counts in {{plan_summary_path}}
+don't tell them what's actually risky.
+
+## Inputs
+
+- Plan summary: {{plan_summary_path}}
+- Project state: {{state_yaml}}
+- Report output: {{output_path}}
+
+## Goal
+
+Make the apply decision easy. The `aws-api` MCP is enabled — query
+current AWS state to compare against the plan if helpful.
+
+## Required output structure
+
+```
+# Plan Review — {{repo_name}}
+
+## TL;DR
+One sentence: what this apply does and what its biggest risk is.
+
+## Resource summary
+- Total to add / change / destroy
+
+## High-risk changes
+For each: what changes, why risky, what to watch for during apply,
+estimated time to complete that unit.
+
+## Cost delta
+Estimated monthly cost delta. Itemise biggest contributors.
+
+## Blast radius
+Which user-facing components affected (downtime, cold starts, DNS,
+cert revalidation).
+
+## Reversibility
+- Resources you can `apply` back safely
+- Resources where rollback requires data restoration / DNS work
+- Resources where rollback is impossible without outage
+
+## Pre-flight checklist
+- [ ] backups taken
+- [ ] DNS TTL lowered (if cert/ALB changing)
+- [ ] feature flags ready
+- [ ] etc — based on what this plan actually does
+```
+
+## Constraints
+
+- English only.
+- Numbers must come from plan summary or live AWS API. No hand-waved
+  estimates.
+- When done, print one line: `WROTE {{output_path}}` and stop.

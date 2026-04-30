@@ -3,6 +3,12 @@
 version: "1.0.0"
 title: "Recommend infrastructure"
 description: "Pick 2-3 IaC skeletons that fit the application and rank them with cost and trade-offs."
+# Tuned for Opus 4.7. Mid temp because real comparison and aw-aware
+# trade-off reasoning needs some breathing room (not just deterministic
+# table-fill). max_turns wide so the model can both read full skeleton
+# READMEs and probe AWS via aws-api MCP.
+temperature: 0.4
+max_turns: 50
 parameters:
   - key: repo_name
     input_type: string
@@ -140,4 +146,9 @@ prompt: |
   - Cost estimates are rough. Always include both dev and prod.
   - Be honest about complexity. Do not over-recommend Kubernetes for a single
     small service.
+  - The `aws-api` and `terraform` MCPs are enabled. Use them to ground the
+    recommendation in REAL data: existing VPCs/subnets, Service Quotas,
+    current minor engine versions, live pricing if cheaper to verify than
+    memorize. Every cost/version/quota you cite must come from skeleton
+    READMEs, queried AWS state, or be explicitly marked as an estimate.
   - When done, print one line: `WROTE {{ output_path }}` and stop.

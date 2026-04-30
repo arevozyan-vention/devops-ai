@@ -3,6 +3,9 @@
 version: "1.0.0"
 title: "Upgrade application"
 description: "Deploy a specified git ref with stricter validation (5x smoke test, prod gate)."
+# Tuned for Opus 4.7. Zero temp — production rollout is procedural.
+temperature: 0.0
+max_turns: 60
 parameters:
   - key: repo_name
     input_type: string

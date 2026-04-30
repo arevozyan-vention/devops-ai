@@ -7,6 +7,11 @@
 version: "1.0.0"
 title: "Apply infrastructure"
 description: "Run terragrunt apply across all units in dependency order, then capture outputs as JSON."
+# Tuned for Opus 4.7. Zero temp — apply must be strictly procedural, no
+# creative deviation from the approved plan. max_turns very wide because
+# apply walks 11+ units and may need partial-failure recovery.
+temperature: 0.0
+max_turns: 100
 parameters:
   - key: repo_name
     input_type: string
@@ -123,8 +128,19 @@ prompt: |
      test -s {{ outputs_path }} && jq empty {{ outputs_path }}
      ```
 
-  6. Print one line summarizing the key live endpoints (whichever exist in
-     outputs): cluster name, ECS service name, ALB DNS, RDS endpoint.
+  6. Print a `## Access summary` block listing every live endpoint the
+     operator will need next. Pull values from the outputs you just
+     captured:
+     - **Application URL**:    `http://<alb_dns_name>/`
+     - **Health check**:       `http://<alb_dns_name>/api/v1/health`
+     - **Keycloak admin** (if keycloak extension was deployed):
+                               `http://<alb_dns_name><url_path>/`
+     - **RDS endpoint**:       `<db_instance_endpoint>` (port 5432)
+     - **ECS cluster**:        `<cluster_name>`
+     - **ECS service**:        `<service_name>`
+     - **ECR repository**:     `<repository_url>`
+     If a value is empty in outputs, just omit that line — never fabricate
+     a placeholder.
 
   7. Print exactly one final line and stop:
      ```

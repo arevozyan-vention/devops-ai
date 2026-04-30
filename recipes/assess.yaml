@@ -1,0 +1,140 @@
+# Goose recipe: combined analyze + recommend in a single Opus 4.7 session.
+# Designed to exploit 1M-token context — the model holds the full repo and the
+# skeleton catalogue at once, no round-trip cost. Writes both the overview
+# and the infra-options doc in one go.
+version: "1.0.0"
+title: "Assess repository and recommend infrastructure"
+description: "Read source code, write 01_overview.md, then pick 2-3 IaC skeletons → 02_infra_options.md."
+# Tuned for Opus 4.7. Mid-low temp because step 1 (overview) is factual and
+# step 2 (recommend) needs some reasoning latitude. max_turns wide because we
+# do the work of two recipes here.
+temperature: 0.3
+max_turns: 100
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name under projects/."
+  - key: source_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to the repository source tree (read-only)."
+  - key: templates_dir
+    input_type: string
+    requirement: required
+    description: "Absolute path to framework/templates/iac/ — the skeleton catalog."
+  - key: overview_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to docs/01_overview.md to write."
+  - key: options_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to docs/02_infra_options.md to write."
+  - key: state_yaml
+    input_type: string
+    requirement: required
+    description: "Absolute path to the project's state.yaml (project history / context)."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are a DevOps engineer producing two artefacts in one session:
+  (1) an objective technical overview of an application, and
+  (2) a ranked list of 2-3 AWS IaC options that fit it.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - Source code path (read-only): {{ source_path }}
+  - Skeleton catalogue (read-only): {{ templates_dir }}
+  - Project state (read-only): {{ state_yaml }}
+  - Overview output path: {{ overview_path }}
+  - Options output path: {{ options_path }}
+
+  ## Goal
+
+  Both files must exist and be useful as input to the downstream
+  `select` and `generate-iac` steps. The overview is consumed by
+  `recommend`-style reasoning that's already happening in this same
+  session, so structure it for ease of cross-reference.
+
+  ## Suggested approach
+
+  1. Read the source tree at {{ source_path }} broadly enough to be
+     confident about: language/framework, persistence, runtime
+     topology (web/api/worker/cron), external integrations, secrets,
+     existing deployment artefacts. Use full file reads; you have the
+     context for it. Skip lockfiles, vendored deps, and test fixtures.
+  2. Optionally use the `aws-api` MCP to ground claims that involve
+     AWS (e.g. existing IAM roles, VPC defaults the user already has).
+  3. Read {{ state_yaml }} for any prior decisions, deploys, or
+     environment quirks recorded by previous flows.
+  4. Write {{ overview_path }} with the structure below.
+  5. List all skeletons under {{ templates_dir }} and read each
+     skeleton's README.md.
+  6. Pick 2-3 best fits. For each, fill the structure below with
+     concrete numbers — cost ranges (cite skeleton READMEs or AWS
+     pricing if you queried it), trade-offs, caveats. No empty
+     placeholders. The `terraform` MCP is enabled for live registry
+     lookups if you need to verify a module's current arguments.
+  7. Write {{ options_path }}.
+  8. Print the success marker on its own line.
+
+  ## Required overview structure ({{ overview_path }}, Markdown, English)
+
+  ```
+  # {{ repo_name }} — Repository Overview
+
+  ## Summary
+  ## Tech Stack
+  ## Runtime Topology
+  | Component | Process / entrypoint | Port | Notes |
+  ## Persistence
+  ## External Integrations
+  ## Build & Run
+  ## Configuration
+  - Required env vars (mark secrets)
+  ## Existing Infrastructure Artifacts
+  ## Open Questions
+  ```
+
+  Cite file:line for every non-obvious claim.
+
+  ## Required options structure ({{ options_path }})
+
+  ```
+  # {{ repo_name }} — Infrastructure Options
+
+  ## Decision Drivers
+  - what about the app drives the choice (containers? stateful? scale?)
+
+  ## Option A: <name> (recommended)
+  - **Skeleton**: <id from {{ templates_dir }}>
+  - **Why it fits**: 4-5 concrete arguments tied to the overview
+  - **Components provisioned**:
+  - **Recommended extensions**:
+  - **Estimated cost**: dev: $X/month, prod: $Y/month
+  - **Operational complexity**: low | medium | high
+  - **Trade-offs**:
+  - **Caveats / what the operator must still provide**:
+
+  ## Option B: <name>
+  ... (same fields)
+
+  ## Option C: <name>
+  ... (same fields, optional)
+
+  ## Selection command
+  Operator should run:
+      ./devops-ai.sh select {{ repo_name }} --skeleton <id> --region <r> --env <e> [--include <csv>]
+  ```
+
+  ## Constraints
+
+  - Both outputs in **English only**.
+  - Use only skeleton ids that actually exist in {{ templates_dir }}.
+  - Every cost / version / quota you cite must come from skeleton READMEs,
+    queried AWS state, or be marked as an estimate. No hand-waved
+    numbers.
+  - When done, print one line: `WROTE {{ options_path }}` and stop.

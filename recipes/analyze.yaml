@@ -4,6 +4,10 @@
 version: "1.0.0"
 title: "Analyze repository"
 description: "Read source code and produce a structured overview Markdown file in English."
+# Tuned for Claude Opus 4.7. Low temp = factual exploration, no inference;
+# wide max_turns so the model can read files end-to-end rather than skim.
+temperature: 0.2
+max_turns: 60
 parameters:
   - key: repo_name
     input_type: string
@@ -112,13 +116,12 @@ prompt: |
     "Open Questions".
   - Be terse. Bullet points over prose.
   - Cite file paths in backticks where it adds verifiability.
-  - **Stay focused.** Read only files that determine deployment shape:
-    manifests, Dockerfiles, docker-compose, env files, IaC. Do NOT:
-      - recursively `grep` through source code looking for usage of features
-      - read i18n / translation bundles, large generated TS types, lockfiles,
-        vendored dependencies, or test fixtures
-      - cat any single file longer than ~300 lines (use `head` if you need a
-        taste; full content is rarely necessary)
-    Tool calls are budgeted: aim for **under 20 total**. Stop exploring once
-    you have enough to fill every required section.
+  - Use as many tool calls as you need to be confident in the output.
+    You have a 1M-token context — prefer reading fewer files completely
+    over many files in fragments. Skip lockfiles, vendored deps, test
+    fixtures, and generated types — they add noise without changing
+    deployment shape.
+  - The `aws-api` MCP is enabled. If something in the repo references an
+    AWS resource (existing IAM role, VPC ID, S3 bucket), you may verify
+    it exists and surface that as ground-truth in the overview.
   - When done, print one line: `WROTE {{ output_path }}` and stop.

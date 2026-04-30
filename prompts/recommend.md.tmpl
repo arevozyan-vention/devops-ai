@@ -114,4 +114,14 @@ optional; omit it if no extensions are needed.
 - Cost estimates are rough. Always include both dev and prod.
 - Be honest about complexity. Do not over-recommend Kubernetes for a single
   small service.
+- The `aws-api` and `terraform` MCPs are enabled. Use them to ground the
+  recommendation in REAL data when relevant: existing VPCs/subnets the
+  user already has (so you can suggest reusing them), Service Quota
+  ceilings in their region, current minor versions of RDS/EKS engines
+  (so you don't recommend something AWS already retired). Cost estimates
+  may also pull from the live pricing endpoint if cheaper to verify than
+  to memorize. **Every cost number, version, or quota you mention in
+  the document should either come from the skeleton READMEs you read,
+  the AWS account you queried, or be marked as an estimate.** No hand-
+  waved numbers.
 - When done, print one line: `WROTE {{output_path}}` and stop.
