@@ -21,7 +21,7 @@ parameters:
   - key: output_path
     input_type: string
     requirement: required
-    description: "Absolute path to docs/07_audit.md to write."
+    description: "Absolute path to docs/09_audit.md to write."
   - key: state_yaml
     input_type: string
     requirement: required

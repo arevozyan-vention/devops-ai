@@ -39,7 +39,7 @@ mandatory):
 
 1. Read the overview ({{overview_path}}) and inputs.yaml ({{vars_yaml}})
    so you have the application facts in working memory.
-2. Inspect the IaC tree at {{iac_dir}} — note the structure of `live/`
+2. Inspect the IaC tree at {{iac_dir}} — note the structure of `environments/`
    (per-env terragrunt configs) vs `_envcommon/` (shared), and which
    units are wired together via `dependency` blocks.
 3. Find every `TODO(devops-ai)` marker (the framework's prep file
@@ -49,7 +49,7 @@ mandatory):
    consistent resolution — not a syntactic str_replace.
 5. Apply the edits via `text_editor str_replace` (or `text_editor write`
    when restructuring blocks).
-6. Run `terragrunt hcl format --working-dir {{iac_dir}}/live` once.
+6. Run `terragrunt hcl format --working-dir {{iac_dir}}/environments` once.
 7. Verify: `grep -rn 'TODO(devops-ai)' {{iac_dir}}` should return zero
    results in real HCL/TF files (false-positives in the worklist
    tracking file are fine — explicitly note them).

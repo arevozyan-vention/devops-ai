@@ -91,36 +91,68 @@ prompt: |
      ```
      Note the account id and ARN. Include both at the top of the summary file.
 
-  2. `cd {{ iac_dir }}/live/{{ env }}` and run plan:
+  2. **Detect greenfield first.** Check whether the project has any existing
+     Terraform state (i.e. whether `apply` has run before):
      ```
-     terragrunt run --all plan --non-interactive
+     aws s3 ls s3://<state_bucket>/<repo>/<env>/ 2>/dev/null | grep -q '\.tfstate$' \
+       && echo "EXISTING" || echo "GREENFIELD"
      ```
-     Tee the output to a file under `/tmp` so you can grep it later instead of
-     re-running plan. Capture exit code.
+     The `<state_bucket>` is `{{ repo_name }}-tfstate` per the skeleton's
+     default. If you can't determine, assume GREENFIELD.
 
-  3. Parse the plan stdout (NOT the source files) to extract per-unit
+  3. **Run plan, excluding known-greenfield-incompatible units.**
+
+     On GREENFIELD some upstream modules (notably
+     `terraform-aws-modules/ecs/aws//modules/service` v5.x) execute
+     `data "aws_subnet"` / `data "aws_security_group"` lookups at plan
+     time against a VPC that has not yet been created. This is not an IaC
+     bug — the VPC will be applied first in the apply phase, after which
+     those units plan and apply cleanly. To avoid noise, **skip those
+     units in the plan pass** when greenfield. The skeleton's
+     known-affected units are:
+     - `ecs-service`            (always present)
+     - `ecs-service-frontend`   (only if `include_frontend=true` in inputs.yaml)
+     - `keycloak`               (only if `include_keycloak=true` in inputs.yaml)
+
+     Run plan with explicit exclusions when greenfield:
+     ```
+     cd {{ iac_dir }}/environments/{{ env }}
+     EXCLUDES="--queue-exclude-dir=ecs-service"
+     grep -q 'include_frontend:.*true' "{{ iac_dir }}/inputs.yaml" \
+       && EXCLUDES="$EXCLUDES --queue-exclude-dir=ecs-service-frontend"
+     grep -q 'include_keycloak:.*true' "{{ iac_dir }}/inputs.yaml" \
+       && EXCLUDES="$EXCLUDES --queue-exclude-dir=keycloak"
+     terragrunt run --all plan $EXCLUDES --non-interactive
+     ```
+     When EXISTING (state already in S3), drop the excludes and run a
+     full plan — drift detection on those units matters and is reliable
+     post-apply.
+
+     Tee the output to a file under `/tmp` so you can grep it later
+     instead of re-running plan. Capture exit code.
+
+  4. Parse the plan stdout (NOT the source files) to extract per-unit
      `Plan: N to add, M to change, K to destroy.` lines. The format is:
        `[<unit>] terraform: Plan: N to add, M to change, K to destroy.`
      Build the summary table from these lines and these lines only.
 
-  4. **Greenfield handling.** On a clean account some downstream units (most
-     commonly `ecs-service`) cannot be planned because their published Terraform
-     module uses `data "aws_subnet"` / `data "aws_security_group"` lookups that
-     query AWS for resources that do not yet exist. Symptoms:
-     - `Error: no matching EC2 Subnet found`
-     - `Error: no matching EC2 Security Group found`
-     - errors referencing `data.aws_subnet`, `data.aws_security_group`, etc.
-     This is **not** an IaC bug. List those units in the summary under a
-     "Deferred to apply" section and continue. They will plan/apply correctly
-     during the apply phase, after their dependencies are created.
+  5. **Document the deferred units** in the summary's "Deferred to apply"
+     section. List the excluded units explicitly and explain that they
+     were skipped in plan because of upstream module greenfield
+     data-source limitations — apply will plan-and-apply them in one
+     pass. Include a one-line resource expectation per unit (e.g.
+     "ecs-service: ~5 new resources — task definition, service, security
+     group, IAM bindings"). Do **not** include verbose stderr blocks for
+     these — operator already knows from this section.
 
-  5. **Real failures still stop you.** If a unit fails for any other reason
-     (HCL syntax, missing module, IAM permission denied, S3 backend error,
-     stale state lock that you could not clear, etc.), do NOT produce a success
-     marker. Write `## Plan failed` at the top of the summary file with the
-     verbatim error and stop.
+  6. **Real failures still stop you.** If a unit fails for any reason
+     OTHER than the known greenfield data-source pattern (HCL syntax,
+     missing module, IAM permission denied, S3 backend error, stale
+     state lock that you could not clear, etc.), do NOT produce a
+     success marker. Write `## Plan failed` at the top of the summary
+     file with the verbatim error and stop.
 
-  6. Write `{{ plan_summary_path }}` with this structure (Markdown):
+  7. Write `{{ plan_summary_path }}` with this structure (Markdown):
 
      ```
      # Plan summary — {{ repo_name }} / {{ env }} / {{ region }}
@@ -152,7 +184,7 @@ prompt: |
      <last ~50 lines of plan stdout, for traceability>
      ```
 
-  7. Print exactly one final line and stop:
+  8. Print exactly one final line and stop:
      ```
      PLAN READY plan_summary={{ plan_summary_path }}
      ```

@@ -10,10 +10,15 @@ project_name: "{{project_name}}"
 region: "{{region}}"
 account_id: "{{account_id}}"
 
-# Container runtime
+# Container runtime — backend (the primary service)
 container_name: "{{container_name}}"
 container_port: "{{container_port}}"
 health_check_path: "{{health_check_path}}"
+
+# Container runtime — frontend (opt-in, see include_frontend below)
+frontend_container_name: "{{frontend_container_name}}"
+frontend_container_port: "{{frontend_container_port}}"
+frontend_health_check_path: "{{frontend_health_check_path}}"
 
 # RDS Postgres
 db_engine_version: "{{db_engine_version}}"
@@ -27,11 +32,14 @@ domain_name: "{{domain_name}}"
 log_retention_days: "{{log_retention_days}}"
 
 # Optional add-ons. Set to "true" to deploy. Defaults to "false" — leaves in
-# live/<env>/{keycloak,alb-https}/ check this and skip themselves unless
+# environments/<env>/{keycloak,alb-https}/ check this and skip themselves unless
 # explicitly opted in. The recommend step writes guidance into
 # 02_infra_options.md telling the operator which flags to flip.
 include_keycloak:  "{{include_keycloak}}"   # OIDC auth via Keycloak (Fargate sibling)
 include_alb_https: "{{include_alb_https}}"  # self-signed HTTPS for no-domain dev
+include_redis:     "{{include_redis}}"      # ElastiCache Redis (cache / sessions / job queues)
+include_queue:     "{{include_queue}}"      # SQS work queue + DLQ (background jobs / async events)
+include_frontend:  "{{include_frontend}}"   # second ECS service for SPA / static frontend (ALB path-routes /api/* to backend, rest to frontend)
 
 # Remote state — operator-controlled, lives outside this skeleton.
 state_bucket: "{{state_bucket}}"

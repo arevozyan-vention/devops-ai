@@ -55,14 +55,30 @@ require_docker_running() {
 }
 
 require_claude_authenticated() {
-  require_command claude "npm i -g @anthropic-ai/claude-code" || return 1
-  require_command claude-agent-acp "npm i -g @agentclientprotocol/claude-agent-acp" || return 1
-  if ! claude --print --model "${REQUIRED_MODEL:-claude-opus-4-7}" "ok" >/dev/null 2>&1; then
-    echo "validators.sh: claude CLI not authenticated (or model unreachable)" >&2
-    echo "  Run: claude   (interactive OAuth login under your Claude Max plan)" >&2
+  require_command goose "see https://github.com/block/goose" || return 1
+
+  # Path A — API key set: verify cheaply via /v1/models endpoint.
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    if curl -fsS --max-time 5 \
+         -H "x-api-key: $ANTHROPIC_API_KEY" \
+         -H "anthropic-version: 2023-06-01" \
+         https://api.anthropic.com/v1/models >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "validators.sh: ANTHROPIC_API_KEY set but Anthropic /v1/models rejected it" >&2
+    echo "  Bad key, no credits, or rate-limited?" >&2
     return 1
   fi
-  return 0
+
+  # Path B — OAuth: claude CLI must answer.
+  if command -v claude >/dev/null 2>&1 \
+     && claude --print --model "${REQUIRED_MODEL:-claude-opus-4-7}" "ok" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "validators.sh: no working Anthropic auth detected." >&2
+  echo "  Either set ANTHROPIC_API_KEY (sk-ant-...) OR run 'claude' for OAuth login." >&2
+  return 1
 }
 
 require_goose() {
@@ -87,10 +103,40 @@ require_project() {
 }
 
 require_dockerfile() {
+  # Soft sanity check: at least one plausible Dockerfile somewhere under
+  # the source tree. The deploy-app recipe (Phase 1.4) does the real
+  # discovery with role-aware patterns (`*-server`, `packages/<pkg>/`,
+  # etc.) — we don't want to gate ahead of that with brittle heuristics.
+  #
+  # Two things this fixes vs. the previous version:
+  #   1) The previous check hardcoded `<root>/projects/<repo>/source/` but
+  #      `init <path>` records the actual source location in state.yaml
+  #      (often outside that hardcoded path — e.g. /workspace/sources/<repo>
+  #      when the operator bind-mounts a sibling source tree). Read the
+  #      real path from state instead.
+  #   2) The previous check accepted ANY Dockerfile up to depth 3, which
+  #      matched editor-config files like `.cursor/Dockerfile` while
+  #      missing the real ones at `packages/*-server/Dockerfile`. Search
+  #      deeper and skip dotfile directories.
   local repo="$1"
-  local src="$DEVOPS_AI_ROOT/projects/$repo/source"
-  if [[ ! -f "$src/Dockerfile" ]] && [[ -z "$(find "$src" -maxdepth 3 -name 'Dockerfile' -print -quit 2>/dev/null)" ]]; then
-    echo "validators.sh: no Dockerfile found under projects/$repo/source/" >&2
+
+  local src=""
+  if [[ -f "$DEVOPS_AI_ROOT/projects/$repo/state.yaml" ]] && command -v yq >/dev/null 2>&1; then
+    src="$(yq -r '.source_path // ""' "$DEVOPS_AI_ROOT/projects/$repo/state.yaml" 2>/dev/null)"
+  fi
+  [[ -z "$src" ]] && src="$DEVOPS_AI_ROOT/projects/$repo/source"
+
+  if [[ ! -d "$src" ]]; then
+    echo "validators.sh: source path '$src' (from state.yaml) does not exist" >&2
+    return 1
+  fi
+
+  # Search up to 5 levels, skip hidden dirs (.git, .cursor, .vscode, etc.).
+  local found
+  found="$(find "$src" -maxdepth 5 -type d -name '.*' -prune -o -type f -name 'Dockerfile' -print 2>/dev/null | head -1)"
+  if [[ -z "$found" ]]; then
+    echo "validators.sh: no Dockerfile found anywhere under $src" >&2
+    echo "  deploy-app needs at least one Dockerfile to build." >&2
     return 1
   fi
   return 0
@@ -154,16 +200,7 @@ preflight_rollback() {
 }
 
 # New Opus 4.7-tuned recipes:
-# - explain-plan reads plan_summary.md, may call aws-api MCP, no IaC mutations
 # - audit walks IaC + queries live AWS via aws-api MCP, no mutations
-preflight_explain_plan() {
-  local repo="$1"
-  require_project "$repo"
-  require_claude_authenticated
-  require_goose
-  require_aws_creds
-}
-
 preflight_audit() {
   local repo="$1"
   require_project "$repo"

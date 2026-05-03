@@ -47,7 +47,7 @@
 | RDS backup retention | 1 day | 7 days | 14 days |
 | NAT gateways | 1 | 1 | 2 |
 
-These defaults live in `live/<env>/env.hcl` and are easy to edit before deploy.
+These defaults live in `environments/<env>/env.hcl` and are easy to edit before deploy.
 
 ## Estimated monthly cost (AWS on-demand list, no Savings Plan)
 
@@ -97,7 +97,7 @@ What the operator must do **outside** this skeleton:
 ecs-fargate-rds/
 ├── README.md                          (this file — read by `recommend`)
 ├── inputs.yaml.tmpl                   (variable contract; rendered into projects/<repo>/iac/inputs.yaml)
-└── live/
+└── environments/
     ├── terragrunt.hcl                 (root: remote state + provider config)
     ├── _envcommon/                    (per-component shared HCL)
     │   ├── vpc.hcl

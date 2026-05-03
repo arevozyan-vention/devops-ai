@@ -72,12 +72,29 @@ prompt: |
     The `keycloak` extension provisions a Keycloak Fargate service path-
     routed at /auth on the existing ALB. The `alb-https` extension adds an
     HTTPS listener with a self-signed cert (browser warns once).
-  - **Redis / ElastiCache**: not in `ecs-fargate-rds`. Operator must add a
-    sidecar Fargate task (`redis:8-alpine`) or ElastiCache (separate IaC
-    extension, not in catalog yet).
-  - **Multi-container apps (backend + frontend)**: `ecs-fargate-rds`
-    provisions ONE ECS service. Second service must be added manually,
-    OR frontend can ship to S3+CloudFront separately.
+  - **Redis / ElastiCache**: `ecs-fargate-rds` ships an opt-in Redis
+    extension. Enable with `--include redis` — provisions a single-node
+    ElastiCache (cache.t4g.micro, ~$13/mo dev) and auto-injects
+    `REDIS_URL=redis://<endpoint>:6379` into the app container. When the
+    flag is off, `REDIS_URL` is left empty so the app falls through to its
+    in-process / no-op cache path.
+  - **Background jobs / async events / SQS**: `ecs-fargate-rds` ships an
+    opt-in queue extension. Enable with `--include queue` — provisions one
+    SQS work queue + DLQ (~free for dev volumes), auto-attaches send/receive
+    IAM permissions to the ECS task role, and injects `QUEUE_URL` and
+    `DLQ_URL` into the container. Recommend this when the app uses BullMQ /
+    Sidekiq / Celery / SQS-SDK / RabbitMQ-style worker patterns. When off,
+    both URLs are empty so the app's queue code path stays dormant.
+  - **Multi-container apps (backend + frontend)**: `ecs-fargate-rds` ships
+    an opt-in frontend extension. Enable with `--include frontend` —
+    provisions a second ECR repo (`<project>-frontend`), a second Fargate
+    service, and an ALB listener rule that path-routes `/api/*` → backend
+    and everything else → frontend on the same DNS. Convention: frontend
+    source code lives at `<source_path>/frontend/` with its own Dockerfile.
+    Recommend this when the project contains a frontend folder with a
+    build pipeline (Vite, Next, CRA, SvelteKit, Vue CLI, Angular CLI).
+    Alternative: ship the frontend to S3+CloudFront separately if you want
+    CDN edge caching — that path is out-of-skeleton.
   - **Secrets values**: every skeleton creates SM secret RESOURCES with
     empty values. Operator must populate via
     `aws secretsmanager put-secret-value` after deploy-infra. RDS-managed
@@ -104,7 +121,7 @@ prompt: |
   - **Skeleton**: `<skeleton-id>`
   - **Why it fits**: bulleted reasons referencing facts from the overview
   - **Components provisioned**: list (VPC, subnets, ECS/EKS/EC2/Lambda, RDS, ALB, ...)
-  - **Recommended extensions**: list (or "none"). Examples: `keycloak`, `alb-https`.
+  - **Recommended extensions**: list (or "none"). Examples: `keycloak`, `alb-https`, `redis`, `queue`, `frontend`.
     Each must be enabled via `--include <ext>` at `select` time.
   - **Estimated cost**:
     - dev: ~$X/month

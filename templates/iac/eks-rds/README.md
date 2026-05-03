@@ -89,7 +89,7 @@ The operator sets these at `select` time:
 eks-rds/
 ├── README.md
 ├── inputs.yaml.tmpl
-└── live/
+└── environments/
     ├── root.hcl
     ├── _envcommon/  { vpc, ecr, secrets, rds-sg, rds, eks, app-iam }.hcl
     ├── dev/   { env.hcl, ... }

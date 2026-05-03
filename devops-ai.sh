@@ -15,6 +15,8 @@ source "$FRAMEWORK_DIR/lib/state.sh"
 source "$FRAMEWORK_DIR/lib/render.sh"
 # shellcheck disable=SC1091
 source "$FRAMEWORK_DIR/lib/validators.sh"
+# shellcheck disable=SC1091
+source "$FRAMEWORK_DIR/lib/outputs.sh"
 
 c_red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 c_green()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -26,6 +28,53 @@ step()  { c_blue "==> $*"; }
 ok()    { c_green "  ✓ $*"; }
 warn()  { c_yellow "  ! $*"; }
 die()   { c_red "  ✗ $*" >&2; exit 1; }
+
+# ---- step intro/outro framing ----------------------------------------------
+# Each cmd_X is wrapped between step_intro (says what's about to happen +
+# rough ETA) and step_outro (says what was produced + the literal next
+# command + access URLs if applicable). Output is plain text so the UI
+# WebSocket stream renders it readably.
+
+# step_intro <action> <eta> <what>
+step_intro() {
+  local action="$1" eta="$2" what="$3"
+  echo
+  c_blue "─────────────────────────────────────────────────────────────"
+  c_blue "  STEP: $action"
+  c_blue "  WHAT: $what"
+  c_blue "  ETA:  $eta"
+  c_blue "─────────────────────────────────────────────────────────────"
+  echo
+  STEP_START_TS=$SECONDS
+}
+
+# Format SECONDS-delta as human duration ("47s", "3m12s", "1h05m").
+_human_dur() {
+  local s="$1"
+  if   (( s < 60   )); then printf '%ds' "$s"
+  elif (( s < 3600 )); then printf '%dm%02ds' "$((s/60))" "$((s%60))"
+  else                      printf '%dh%02dm' "$((s/3600))" "$(((s%3600)/60))"
+  fi
+}
+
+# step_outro <action> [body lines...]
+# Each remaining argument becomes one indented body line. Body is meant
+# for "what was produced", "next command", access URLs, etc.
+step_outro() {
+  local action="$1"; shift
+  local elapsed=$(( SECONDS - ${STEP_START_TS:-$SECONDS} ))
+  local dur; dur="$(_human_dur "$elapsed")"
+  echo
+  c_green "─────────────────────────────────────────────────────────────"
+  c_green "  DONE: $action   (took $dur)"
+  echo
+  local line
+  for line in "$@"; do
+    printf '  %s\n' "$line"
+  done
+  c_green "─────────────────────────────────────────────────────────────"
+  echo
+}
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -60,7 +109,6 @@ _recipe_mcp_plan() {
     analyze|recommend|assess)      echo "aws-api:true  terraform:true"  ;;
     review-iac)                    echo "aws-api:true  terraform:true"  ;;
     audit)                         echo "aws-api:true  terraform:true"  ;;
-    explain-plan)                  echo "aws-api:true  terraform:false" ;;
     generate-iac)                  echo "aws-api:false terraform:true"  ;;
     infra-plan|infra-apply)        echo "aws-api:true  terraform:true"  ;;
     deploy-app|upgrade|rollback)   echo "aws-api:true  terraform:false" ;;
@@ -242,15 +290,13 @@ Workflow commands:
                                          (ecs-fargate-rds: keycloak, alb-https).
   generate-iac <repo>          Render skeleton + AI completes TODO markers.
   review-iac <repo>            Self-review of generated IaC (security/cost/policy)
-                               → docs/03_review.md. Run BEFORE plan-infra.
+                               → docs/05_review.md. Run BEFORE plan-infra.
   aws-login                    Helper around 'aws configure sso'.
   aws-bootstrap [<repo>]       Create the S3 tfstate bucket. Without args:
                                creates 'devops-ai-tfstate-<account>'. With
                                <repo>: reads bucket name from its inputs.yaml.
   plan-infra <repo>            terragrunt run --all plan only. Writes a
                                human-reviewable plan_summary.md. No AWS mutation.
-  explain-plan <repo>          Risk/cost/blast-radius narrative on top of
-                               plan_summary.md → docs/06_plan_review.md.
   apply-infra <repo>           Reads existing plan_summary.md, asks for explicit
                                approval, runs terragrunt apply.
   deploy-infra <repo>          plan + approve + apply in one shot (combines
@@ -265,12 +311,12 @@ Inspection:
   list                         List initialized projects.
   catalog                      List available IaC skeletons + their READMEs.
   audit <repo>                 Drift / posture check vs deployed AWS state
-                               → docs/07_audit.md. Run periodically.
+                               → docs/09_audit.md. Run periodically.
 
 Each step gates on prior state. The command flow is roughly:
   init → analyze → recommend → select → generate-iac → review-iac
-       → plan-infra → explain-plan → apply-infra → deploy-app
-                                                  → upgrade / rollback / audit
+       → plan-infra → apply-infra → deploy-app
+                                  → upgrade / rollback / audit
   Or shortcut: init → assess → select → generate-iac → ...
 EOF
 }
@@ -327,10 +373,15 @@ cmd_init() {
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "project name '$name' must match [A-Za-z0-9._-]+"
 
+  step_intro "init" \
+    "instant" \
+    "Register a new project '$name' under projects/$name/ and remember its source path."
   step "Initializing project '$name' from $source_path"
   state_init "$name" "$source_path"
   ok "project registered at $(project_dir "$name")"
-  ok "next: ./devops-ai.sh analyze $name"
+  step_outro "init" \
+    "Output:  projects/$name/  (state.yaml, docs/, iac/, deploy/)" \
+    "Next:    ./devops-ai.sh analyze $name"
 }
 
 cmd_analyze() {
@@ -340,6 +391,10 @@ cmd_analyze() {
   local source_path
   source_path="$(state_get "$repo" source_path)"
 
+  step_intro "analyze" \
+    "30-90 seconds" \
+    "AI reads your source tree (Dockerfiles, package.json, .env.example, README) and writes a stack overview."
+
   run_recipe analyze "WROTE ${out_path}" \
     "repo_name=$repo" \
     "source_path=$source_path" \
@@ -348,6 +403,10 @@ cmd_analyze() {
   [[ -s "$out_path" ]] || die "analyze: success marker matched but $out_path is empty"
   state_set_bool "$repo" status.analyzed true
   ok "overview written → $out_path"
+  step_outro "analyze" \
+    "Output:  $out_path" \
+    "         (open in UI to see the detected stack, deps, ports, env-vars)" \
+    "Next:    ./devops-ai.sh recommend $repo"
 }
 
 cmd_recommend() {
@@ -358,6 +417,10 @@ cmd_recommend() {
   local out_path="$(project_docs "$repo")/02_infra_options.md"
   local templates_dir="$FRAMEWORK_DIR/templates/iac"
 
+  step_intro "recommend" \
+    "30-90 seconds" \
+    "AI proposes 2-3 IaC skeletons that fit this stack, with cost estimate and caveats."
+
   run_recipe recommend "WROTE ${out_path}" \
     "repo_name=$repo" \
     "overview_path=$overview_path" \
@@ -367,11 +430,19 @@ cmd_recommend() {
   [[ -s "$out_path" ]] || die "recommend: success marker matched but $out_path is empty"
   state_set_bool "$repo" status.recommended true
   ok "options written → $out_path"
+  step_outro "recommend" \
+    "Output:  $out_path" \
+    "         (open in UI — pick one option, note its skeleton id and --include extensions)" \
+    "Next:    ./devops-ai.sh select $repo --skeleton <id> --region <r> --env dev [--include <csv>]"
 }
 
 cmd_select() {
   local repo="${1:-}"; shift || true
   ensure_param "<repo>" "$repo"
+
+  step_intro "select" \
+    "instant" \
+    "Lock in the IaC skeleton, region, and opt-in extensions; render the operator runbook."
 
   local skeleton="" region="" env="" account_id="" include_csv=""
   while [[ $# -gt 0 ]]; do
@@ -394,7 +465,10 @@ cmd_select() {
   ensure_param "--region" "$region"
   ensure_param "--env" "$env"
   require_aws_region "$region"
-  case "$env" in dev|stage|prod) ;; *) die "--env must be one of dev|stage|prod (got '$env')" ;; esac
+  # Skeletons currently ship only the `dev` environment (stage/prod folders
+  # were dropped). Add them back to templates/iac/<skeleton>/environments/
+  # if you decide to support multi-env again.
+  case "$env" in dev) ;; *) die "--env must be 'dev' (got '$env'). Skeletons only ship dev/." ;; esac
   [[ -d "$FRAMEWORK_DIR/templates/iac/$skeleton" ]] \
     || die "skeleton '$skeleton' not found in $FRAMEWORK_DIR/templates/iac/"
 
@@ -403,7 +477,7 @@ cmd_select() {
   # we hardcode the ecs-fargate-rds set. Adding new ones means: add a leaf with
   # `skip = !try(local.inputs_yaml.include_X == "true", false)` and accept the
   # name here.
-  local known_extensions=(keycloak alb-https)
+  local known_extensions=(keycloak alb-https redis queue frontend)
   local extensions_arr=()
   if [[ -n "$include_csv" ]]; then
     IFS=',' read -r -a extensions_arr <<< "$include_csv"
@@ -441,7 +515,7 @@ env: $env
 source_path: $source_path
 EOF
   render_file "$FRAMEWORK_DIR/docs-templates/runbook.md.tmpl" \
-              "$(project_docs "$repo")/04_runbook.md" \
+              "$(project_docs "$repo")/03_runbook.md" \
               "$rb_vars"
   rm -f "$rb_vars"
 
@@ -449,14 +523,23 @@ EOF
   if (( ${#extensions_arr[@]} > 0 )); then
     ok "extensions:        ${extensions_arr[*]}"
   fi
-  ok "runbook → $(project_docs "$repo")/04_runbook.md"
-  ok "next: ./devops-ai.sh generate-iac $repo"
+  ok "runbook → $(project_docs "$repo")/03_runbook.md"
+  step_outro "select" \
+    "Skeleton:   $skeleton" \
+    "Region/env: $region / $env" \
+    "Extensions: ${extensions_arr[*]:-(none)}" \
+    "Output:     $(project_docs "$repo")/03_runbook.md  (read this — it's your operator playbook)" \
+    "Next:       ./devops-ai.sh generate-iac $repo"
 }
 
 cmd_generate_iac() {
   local repo="${1:-}"; ensure_param "<repo>" "$repo"
   preflight_generate_iac "$repo"
   state_check "$repo" selected
+
+  step_intro "generate-iac" \
+    "10-30 seconds (mostly mechanical)" \
+    "Render the chosen skeleton into the project's iac/ tree (Terragrunt units + modules + inputs.yaml)."
 
   local skeleton region env source_path
   skeleton="$(state_get "$repo" infra_option)"
@@ -485,7 +568,7 @@ cmd_generate_iac() {
   # Translate state.yaml's `extensions: keycloak,alb-https` into the
   # include_<ext> = "true|false" booleans the skeleton's inputs.yaml.tmpl
   # expects. Anything not in the comma-list defaults to "false".
-  local extensions_csv inc_keycloak="false" inc_alb_https="false"
+  local extensions_csv inc_keycloak="false" inc_alb_https="false" inc_redis="false" inc_queue="false" inc_frontend="false"
   extensions_csv="$(state_get "$repo" extensions 2>/dev/null || true)"
   if [[ -n "$extensions_csv" && "$extensions_csv" != "null" ]]; then
     case ",${extensions_csv}," in
@@ -493,6 +576,15 @@ cmd_generate_iac() {
     esac
     case ",${extensions_csv}," in
       *,alb-https,*) inc_alb_https="true" ;;
+    esac
+    case ",${extensions_csv}," in
+      *,redis,*)     inc_redis="true"     ;;
+    esac
+    case ",${extensions_csv}," in
+      *,queue,*)     inc_queue="true"     ;;
+    esac
+    case ",${extensions_csv}," in
+      *,frontend,*)  inc_frontend="true"  ;;
     esac
   fi
 
@@ -505,6 +597,9 @@ account_id: "$acct"
 container_name: "app"
 container_port: "8080"
 health_check_path: "/health"
+frontend_container_name: "web"
+frontend_container_port: "80"
+frontend_health_check_path: "/"
 db_engine_version: "16.13"
 db_name: "appdb"
 db_master_username: "appuser"
@@ -512,6 +607,9 @@ domain_name: ""
 log_retention_days: "14"
 include_keycloak: "$inc_keycloak"
 include_alb_https: "$inc_alb_https"
+include_redis: "$inc_redis"
+include_queue: "$inc_queue"
+include_frontend: "$inc_frontend"
 cluster_version: "1.30"
 app_namespace: "default"
 app_service_account: "${repo}-sa"
@@ -568,8 +666,12 @@ EOF
   # Soft check: count TODO markers that remain. Some legitimately stay (e.g.
   # ACM cert ARN when no domain is set), but a high count likely means the AI
   # only explored without editing.
+  # NB: grep returns rc=1 on no-match. With `set -o pipefail`, that bubbles
+  # up to the pipeline and (with `set -e`) kills the script BEFORE we mark
+  # iac_generated=true. `|| true` neutralises grep's no-match exit code;
+  # empty stdout still gives wc -l = 0.
   local todo_count
-  todo_count="$(grep -rn 'TODO(devops-ai)' "$iac_dir" 2>/dev/null | wc -l | tr -d ' ')"
+  todo_count="$( { grep -rn 'TODO(devops-ai)' "$iac_dir" 2>/dev/null || true; } | wc -l | tr -d ' ')"
   if [[ "${todo_count:-0}" -gt 0 ]]; then
     warn "$todo_count TODO(devops-ai) marker(s) remain in $iac_dir — review before deploy-infra"
     grep -rn 'TODO(devops-ai)' "$iac_dir" 2>/dev/null | sed 's|^|    |' >&2 || true
@@ -577,6 +679,11 @@ EOF
 
   state_set_bool "$repo" status.iac_generated true
   ok "IaC ready in $iac_dir"
+  step_outro "generate-iac" \
+    "Output:  $iac_dir  (Terragrunt units in environments/dev/, modules/ tree)" \
+    "         (open the IAC group in UI artifacts to inspect)" \
+    "Next:    ./devops-ai.sh review-iac $repo   (optional: AI security/correctness review)" \
+    "         OR ./devops-ai.sh plan-infra $repo   (skip review, go straight to plan)"
 }
 
 cmd_aws_login() {
@@ -650,11 +757,21 @@ _approval_phrase_for_env() {
 # Portable mtime in epoch seconds for a file. Returns 0 if the file is gone
 # or stat fails on this platform.
 _file_mtime_epoch() {
-  local path="$1"
+  # mtime as unix epoch. Try GNU stat first (Linux containers),
+  # then BSD stat (macOS). The previous order was reversed which
+  # backfired: on GNU coreutils `stat -f` is "display filesystem
+  # status" — it succeeds (rc=0) but prints `  File: ...` text,
+  # not a number. The captured text then poisoned arithmetic
+  # comparisons under `set -u` ("File: unbound variable").
+  local path="$1" m
   [[ -e "$path" ]] || { echo 0; return; }
-  stat -f %m "$path" 2>/dev/null \
-    || stat -c %Y "$path" 2>/dev/null \
-    || echo 0
+  if m=$(stat -c %Y "$path" 2>/dev/null) && [[ "$m" =~ ^[0-9]+$ ]]; then
+    echo "$m"; return
+  fi
+  if m=$(stat -f %m "$path" 2>/dev/null) && [[ "$m" =~ ^[0-9]+$ ]]; then
+    echo "$m"; return
+  fi
+  echo 0
 }
 
 # Real human gate between plan and apply.
@@ -727,8 +844,17 @@ _infra_phase_gate_and_apply() {
     warn "Verify the AWS account id at the top of the summary matches your prod account"
   fi
 
-  if [[ ! -t 0 ]]; then
-    die "stdin is not a TTY — refusing to apply without an interactive operator. Run this command in a terminal."
+  # Approval gate. Default is "must be a TTY" — this prevents unattended
+  # applies from silent contexts (cron, hooks, agent loops) that would
+  # otherwise silently provision real AWS resources.
+  #
+  # The UI is a legitimate non-TTY caller: the operator approves in a
+  # browser modal showing the same plan summary, then the backend sets
+  # DEVOPS_AI_UI_APPROVED=1 and pipes the approval phrase on stdin. Honor
+  # that path, but require the env var explicitly so a missing modal is
+  # surfaced rather than silently applied.
+  if [[ ! -t 0 && "${DEVOPS_AI_UI_APPROVED:-}" != "1" ]]; then
+    die "stdin is not a TTY and DEVOPS_AI_UI_APPROVED is not set — refusing to apply. Run from a terminal, or set DEVOPS_AI_UI_APPROVED=1 and pipe the approval phrase on stdin."
   fi
   local confirm=""
   read -r -p "Type '${need_phrase}' to proceed (anything else aborts): " confirm
@@ -747,6 +873,20 @@ _infra_phase_gate_and_apply() {
     "region=$region" \
     "plan_summary_path=$plan_summary_path" \
     "outputs_path=$outputs_path"
+
+  # Re-merge outputs deterministically. The recipe used to instruct the LLM
+  # to run `terragrunt run --all output -- -json > outputs.json`, but that
+  # form concatenates per-unit JSON without wrapping — the resulting file
+  # is `{...}{...}{...}`, valid line-by-line but invalid as a single
+  # document (`jq empty` fails with "Extra data"). Downstream readers
+  # (deploy-app, _print_access_summary) all expect ONE valid JSON object.
+  # We rebuild it ourselves via merge_terragrunt_outputs (lib/outputs.sh)
+  # which iterates units and `jq * $outs`-merges them. Idempotent — safe
+  # to call even if the recipe already wrote a correct file.
+  step "Merging unit outputs into $outputs_path"
+  if ! merge_terragrunt_outputs "$iac_dir/environments/$env" "$outputs_path"; then
+    die "infra-apply: merge_terragrunt_outputs failed — apply may have produced no outputs (was $iac_dir/environments/$env actually applied?)"
+  fi
 
   [[ -s "$outputs_path" ]] \
     || die "infra-apply: success marker matched but $outputs_path is empty"
@@ -782,10 +922,16 @@ cmd_plan_infra() {
   local region env iac_dir plan_summary_path outputs_path
   _infra_resolve_params "$repo"
 
+  step_intro "plan-infra" \
+    "5-10 minutes (cold cache: cold init for each unit)" \
+    "Run 'terragrunt run --all plan' against AWS — read-only, no resources created. Writes a plan summary you can review."
+
   step "Plan only — terragrunt plan (read-only)"
   _infra_phase_plan "$repo" "$iac_dir" "$env" "$region" "$plan_summary_path"
   ok "plan summary → $plan_summary_path"
-  ok "next: ./devops-ai.sh apply-infra $repo"
+  step_outro "plan-infra" \
+    "Output:  $plan_summary_path  (open and read it — this is what you'll approve at apply)" \
+    "Next:    ./devops-ai.sh apply-infra $repo   (will ask you to type 'apply' to confirm)"
 }
 
 # assess — combined analyze + recommend in one Goose session.
@@ -822,7 +968,7 @@ cmd_assess() {
 }
 
 # review-iac — Opus self-reviews freshly generated IaC for security, cost,
-# correctness, and policy issues BEFORE plan-infra. Writes 03_review.md;
+# correctness, and policy issues BEFORE plan-infra. Writes 05_review.md;
 # does not block plan-infra automatically — operator decides.
 cmd_review_iac() {
   local repo="${1:-}"; ensure_param "<repo>" "$repo"
@@ -831,8 +977,12 @@ cmd_review_iac() {
   local iac_dir; iac_dir="$(project_iac "$repo")"
   local docs; docs="$(project_docs "$repo")"
   local overview_path="$docs/01_overview.md"
-  local out_path="$docs/03_review.md"
+  local out_path="$docs/05_review.md"
   local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
+
+  step_intro "review-iac" \
+    "1-3 minutes" \
+    "AI walks the generated iac/ tree and flags security / cost / correctness issues before any AWS call."
 
   run_recipe review-iac "WROTE ${out_path}" \
     "repo_name=$repo" \
@@ -843,29 +993,9 @@ cmd_review_iac() {
 
   [[ -s "$out_path" ]] || die "review-iac: $out_path empty"
   ok "review → $out_path"
-}
-
-# explain-plan — read deploy/plan_summary.md plus terragrunt outputs and
-# write a risk/cost/blast-radius narrative for human review prior to apply.
-cmd_explain_plan() {
-  local repo="${1:-}"; ensure_param "<repo>" "$repo"
-  preflight_explain_plan "$repo"
-  state_check "$repo" iac_generated
-  local deploy_dir; deploy_dir="$(project_dep "$repo")"
-  local plan_summary_path="$deploy_dir/plan_summary.md"
-  [[ -s "$plan_summary_path" ]] || die "explain-plan: $plan_summary_path missing — run plan-infra first"
-  local docs; docs="$(project_docs "$repo")"
-  local out_path="$docs/06_plan_review.md"
-  local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
-
-  run_recipe explain-plan "WROTE ${out_path}" \
-    "repo_name=$repo" \
-    "plan_summary_path=$plan_summary_path" \
-    "output_path=$out_path" \
-    "state_yaml=$state_yaml"
-
-  [[ -s "$out_path" ]] || die "explain-plan: $out_path empty"
-  ok "plan review → $out_path"
+  step_outro "review-iac" \
+    "Output:  $out_path  (read this — anything red/yellow blocks plan-infra)" \
+    "Next:    ./devops-ai.sh plan-infra $repo"
 }
 
 # audit — drift / posture check against deployed AWS resources. Reads
@@ -878,9 +1008,13 @@ cmd_audit() {
   local deploy_dir; deploy_dir="$(project_dep "$repo")"
   local outputs_path="$deploy_dir/outputs.json"
   local docs; docs="$(project_docs "$repo")"
-  local out_path="$docs/07_audit.md"
+  local out_path="$docs/09_audit.md"
   local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
   local iac_dir; iac_dir="$(project_iac "$repo")"
+
+  step_intro "audit" \
+    "1-3 minutes" \
+    "AI compares iac/ vs deployed AWS state, flags drift, unused resources, security drift, missing tags."
 
   run_recipe audit "WROTE ${out_path}" \
     "repo_name=$repo" \
@@ -891,6 +1025,9 @@ cmd_audit() {
 
   [[ -s "$out_path" ]] || die "audit: $out_path empty"
   ok "audit → $out_path"
+  step_outro "audit" \
+    "Output:  $out_path  (drift report — fix any flagged item or document why it's accepted)" \
+    "Re-run periodically (weekly/monthly) to catch console-side changes."
 }
 
 # Print a human-readable access summary from outputs.json — ALB DNS,
@@ -941,10 +1078,18 @@ cmd_apply_infra() {
   local region env iac_dir plan_summary_path outputs_path
   _infra_resolve_params "$repo"
 
+  step_intro "apply-infra" \
+    "10-20 minutes (RDS dominates: ~6 min)" \
+    "Approve the existing plan summary, then create real AWS resources (VPC, ALB, RDS, ECS, ECR, IAM, secrets). \$ accrues from now."
+
   step "Apply only — using existing plan summary"
   _infra_phase_gate_and_apply "$repo" "$iac_dir" "$env" "$region" \
     "$plan_summary_path" "$outputs_path"
   _print_access_summary "$repo" infra
+  step_outro "apply-infra" \
+    "Output:  $outputs_path  (terragrunt outputs, merged into one JSON)" \
+    "Status:  AWS resources provisioned. ECS task is failing (no image yet) — that's expected." \
+    "Next:    ./devops-ai.sh deploy-app $repo   (build, push, populate secrets, smoke test)"
 }
 
 cmd_deploy_infra() {
@@ -968,25 +1113,45 @@ cmd_deploy_app() {
   preflight_deploy_app "$repo"
   state_check "$repo" infra_deployed
 
-  local region env source_path outputs_path history_path
+  step_intro "deploy-app" \
+    "15-45 minutes (image build dominates; cross-arch qemu on Apple Silicon adds time)" \
+    "Source-aware preflight → pre-fix obvious mismatches → docker build/push → ECS update → smoke test → up to 8 self-heal attempts (3/category)."
+
+  local region env source_path outputs_path history_path iac_dir attempts_path failure_report_path
   region="$(state_get "$repo" region)"
   env="$(state_get "$repo" env)"
   source_path="$(state_get "$repo" source_path)"
   outputs_path="$(project_dep "$repo")/outputs.json"
   history_path="$(project_dep "$repo")/history.jsonl"
+  iac_dir="$(project_iac "$repo")"
+  attempts_path="$(project_docs "$repo")/08_deploy_attempts.md"
+  failure_report_path="$(project_docs "$repo")/08_deploy_failure_report.md"
 
-  run_recipe deploy-app "APP DEPLOYED image=" \
+  # Success marker matches either single-service (`APP DEPLOYED image=`) or
+  # multi-service (`APP DEPLOYED backend=`) form. The self-healing loop in
+  # the recipe prompt also accepts `APP DEPLOY FAILED ...` as a terminal
+  # state, but that yields a non-zero exit at the script level.
+  run_recipe deploy-app 'APP DEPLOYED (image|backend)=' \
     "repo_name=$repo" \
     "source_path=$source_path" \
     "region=$region" \
     "env=$env" \
     "outputs_path=$outputs_path" \
     "history_path=$history_path" \
+    "iac_dir=$iac_dir" \
+    "attempts_path=$attempts_path" \
+    "failure_report_path=$failure_report_path" \
     "git_ref=$git_ref"
 
   state_set_bool "$repo" status.app_deployed true
   ok "deploy-app finished; check $history_path for the record"
   _print_access_summary "$repo" app
+  step_outro "deploy-app" \
+    "Outputs:" \
+    "  - $attempts_path  (every pre-fix and self-heal attempt with reasoning)" \
+    "  - $history_path  (one line per deploy: git sha, image, attempts, result)" \
+    "Open the Application URL above in your browser to use the app." \
+    "When done, free AWS resources:  ./devops-ai.sh destroy $repo"
 }
 
 cmd_upgrade() {
@@ -1086,14 +1251,25 @@ cmd_destroy() {
   [[ "$env" == "dev" ]] || die "destroy is only allowed for env=dev (current: $env). For other envs, run terragrunt destroy manually."
 
   local iac_dir; iac_dir="$(project_iac "$repo")"
-  warn "This will run 'terragrunt run --all destroy' on $iac_dir/live/$env"
+
+  step_intro "destroy" \
+    "5-15 minutes (RDS deletion is the slow part)" \
+    "Tears down ALL AWS resources for $repo / env=$env (VPC, RDS, ECS, ALB, ECR, IAM, secrets, log groups). Stops the billing meter."
+
+  warn "This will run 'terragrunt run --all destroy' on $iac_dir/environments/$env"
   read -r -p "Type the project name '$repo' to confirm: " confirm
   [[ "$confirm" == "$repo" ]] || die "confirmation mismatch — aborted"
 
-  (cd "$iac_dir/live/$env" && TG_PARALLELISM=1 terragrunt run --all destroy --non-interactive)
+  (cd "$iac_dir/environments/$env" && TG_PARALLELISM=1 terragrunt run --all destroy --non-interactive)
   state_set_bool "$repo" status.infra_deployed false
   state_set_bool "$repo" status.app_deployed false
   ok "destroyed env=$env for $repo"
+  step_outro "destroy" \
+    "All Terragrunt-managed AWS resources for $repo / $env have been deleted." \
+    "Possible leftovers (NOT in Terragrunt state, check manually):" \
+    "  - Secrets created by deploy-app self-heal:  aws secretsmanager list-secrets --filters Key=name,Values=$repo/" \
+    "  - CloudWatch log groups:                    aws logs describe-log-groups --log-group-name-prefix /aws/ecs/$repo" \
+    "  - ECR images (if force-delete didn't run):  aws ecr describe-repositories --repository-names $repo-dev"
 }
 
 # ---- entrypoint -------------------------------------------------------------
@@ -1111,7 +1287,6 @@ main() {
     select)                cmd_select "$@" ;;
     generate-iac)          cmd_generate_iac "$@" ;;
     review-iac)            cmd_review_iac "$@" ;;
-    explain-plan)          cmd_explain_plan "$@" ;;
     audit)                 cmd_audit "$@" ;;
     aws-login)             cmd_aws_login "$@" ;;
     aws-bootstrap)         cmd_aws_bootstrap "$@" ;;

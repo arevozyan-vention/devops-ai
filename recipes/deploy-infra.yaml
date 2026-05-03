@@ -60,7 +60,7 @@ prompt: |
 
   2. Run a `plan` for the selected environment:
      ```
-     cd {{ iac_dir }}/live/{{ env }}
+     cd {{ iac_dir }}/environments/{{ env }}
      terragrunt run --all plan --non-interactive
      ```
      Capture the output and present a concise summary to the operator:

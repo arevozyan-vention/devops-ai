@@ -85,7 +85,7 @@ refresh.
 ec2-asg-rds/
 ├── README.md
 ├── inputs.yaml.tmpl
-└── live/
+└── environments/
     ├── root.hcl
     ├── _envcommon/  { vpc, secrets, rds-sg, rds, alb, asg, instance-iam }.hcl
     ├── dev/   { env.hcl, ... }

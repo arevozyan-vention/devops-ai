@@ -80,7 +80,7 @@ means the operator pays nothing when traffic is zero.
 lambda-apigw-dynamo/
 ├── README.md
 ├── inputs.yaml.tmpl
-└── live/
+└── environments/
     ├── root.hcl
     ├── _envcommon/  { ecr, secrets, dynamo, lambda, apigw }.hcl
     ├── dev/   { env.hcl, ... }

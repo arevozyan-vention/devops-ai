@@ -44,6 +44,23 @@ terragrunt. If Goose rejects this value as too large, fall back to
 `timeout_secs=3600` and report the rejection in your next message — do not
 silently drop to a smaller number.
 
+## DO NOT use Monitor / background tail for `terragrunt apply`
+
+`terragrunt run --all apply` has a definite end (the process exits when the
+last unit finishes or fails). Run it **synchronously** as a single shell
+call with a generous `timeout_secs`. Do NOT pipe its log into a `tail -F`
+under Monitor or under `run_in_background` — by the time your tail starts,
+the apply may have already printed its completion lines, and the tail will
+hang forever waiting for new lines that never come. Several real runs have
+been wedged this way for 30+ minutes after the apply itself finished.
+
+Synchronous form (the only correct form for this recipe):
+```
+cd <iac_dir>/environments/<env> && \
+  TG_PARALLELISM=1 terragrunt run --all apply --non-interactive
+```
+Wait for it to return. Read the exit code. Done.
+
 ## Task
 
 1. Confirm AWS identity:
@@ -54,7 +71,7 @@ silently drop to a smaller number.
    `{{plan_summary_path}}`. If they differ, STOP — do not apply against a
    different account than the one the operator approved.
 
-2. `cd {{iac_dir}}/live/{{env}}` and run apply:
+2. `cd {{iac_dir}}/environments/{{env}}` and run apply:
    ```
    terragrunt run --all apply --non-interactive
    ```
@@ -68,25 +85,20 @@ silently drop to a smaller number.
    stop. The operator will decide whether to retry, fix manually, or roll
    back the partial creation.
 
-4. Capture outputs as JSON to `{{outputs_path}}`:
-   ```
-   terragrunt run --all output --non-interactive -- -json > {{outputs_path}}
-   ```
-   If the combined `--all output -json` form fails, fall back to per-unit:
-   iterate over the unit dirs that successfully applied, run
-   `terragrunt --working-dir <unit> output -- -json` for each, merge the
-   JSON objects under unit names, and write the merged JSON to
-   `{{outputs_path}}`.
+4. Outputs collection is **not your job**. The framework wrapper
+   (`merge_terragrunt_outputs` in `lib/outputs.sh`) iterates units and
+   produces a correctly-merged `{{outputs_path}}` AFTER you emit the
+   success marker. The legacy `terragrunt run --all output -- -json >
+   {{outputs_path}}` invocation is broken (per-unit JSON gets concatenated,
+   invalid as a single document) and must NOT be used here. Just don't
+   touch the outputs file.
 
-5. Verify `{{outputs_path}}` is non-empty and is valid JSON:
-   ```
-   test -s {{outputs_path}} && jq empty {{outputs_path}}
-   ```
+5. Print one line summarizing what was applied (count of units that
+   succeeded vs. failed, taken from terragrunt's "Run Summary" stdout).
+   Do NOT fabricate endpoints — those will be filled in by the framework
+   wrapper from real terragrunt output.
 
-6. Print one line summarizing the key live endpoints (whichever exist in
-   outputs): cluster name, ECS service name, ALB DNS, RDS endpoint.
-
-7. Print exactly one final line and stop:
+6. Print exactly one final line and stop:
    ```
    INFRA DEPLOYED env={{env}} region={{region}}
    ```
@@ -97,10 +109,9 @@ silently drop to a smaller number.
   "Type apply to proceed" or any equivalent. The operator is not connected
   to your stdin.
 
-- **Anti-hallucination.** The contents of `{{outputs_path}}` MUST come from
-  real `terragrunt output` stdout. Never fabricate ARNs, endpoints, or IDs.
-  If outputs cannot be captured, write an empty JSON object `{}` and DO NOT
-  print the success marker.
+- **Anti-hallucination.** Do not write to `{{outputs_path}}`. The
+  framework wrapper handles it after you exit. Never fabricate ARNs,
+  endpoints, or IDs in your stdout either.
 
 - **Account safety.** If AWS identity in step 1 does not match the account
   the plan was approved against, STOP without applying.

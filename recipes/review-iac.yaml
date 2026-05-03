@@ -24,7 +24,7 @@ parameters:
   - key: output_path
     input_type: string
     requirement: required
-    description: "Absolute path to docs/03_review.md to write."
+    description: "Absolute path to docs/05_review.md to write."
   - key: state_yaml
     input_type: string
     requirement: required
