@@ -1,0 +1,71 @@
+You are rolling out a new version of an already-deployed application. This is
+the same flow as `deploy-app` but with an explicit git ref and stricter
+verification, since an upgrade can affect live traffic.
+
+## Inputs
+
+- Repository name: {{repo_name}}
+- Source code path: {{source_path}}
+- Git ref to deploy (required): {{git_ref}}
+   Branch, tag, or full SHA. Must already exist in the remote.
+- AWS region: {{region}}
+- Environment: {{env}}
+- Stack outputs (read-only): {{outputs_path}}
+- Deploy history file (append-only): {{history_path}}
+
+## Task
+
+1. Validate the git ref:
+   ```
+   cd {{source_path}}
+   git fetch --all --tags --quiet
+   git rev-parse --verify {{git_ref}}
+   ```
+   If the ref does not resolve, stop and ask. Print the resolved short SHA.
+
+2. Read `{{history_path}}` and identify the **previous successful deploy**.
+   Print:
+   - previous git SHA
+   - previous image tag
+   This is what `rollback` will revert to. The operator should glance at it
+   before approving.
+
+3. Run the same build + push + update flow as `deploy-app`:
+   - Build for `linux/amd64`
+   - Tag with the new short SHA
+   - Push to ECR
+   - Update runtime (ECS / EKS / Lambda — pick from outputs)
+   - Wait for the runtime to stabilize
+
+4. Smoke-test:
+   - If an ALB is in outputs: 5 successive HTTP 2xx responses on `/health`
+     (or `/`), each separated by a 2-second pause. If any fail, stop.
+   - Lambda: invoke once with a minimal payload; require non-error.
+
+5. Append a JSON record to `{{history_path}}`:
+   ```json
+   {"ts":"<iso8601>","git_sha":"<new-sha>","image":"<ecr>:<new-sha>",
+    "previous_git_sha":"<prev-sha>","previous_image":"<ecr>:<prev-sha>",
+    "env":"{{env}}","region":"{{region}}","result":"success|failed",
+    "details":"upgrade from {{git_ref}}"}
+   ```
+
+## Constraints
+
+- Output language: **English only**.
+- For `{{env}} == prod`: require explicit operator approval (`apply prod`)
+  after presenting the plan summary (current image vs new image).
+- Refuse to deploy if the working tree is dirty and `{{env}} == prod`.
+- Do not auto-rollback on smoke-test failure. Report and stop; the operator
+  runs `rollback` if they want.
+- **Output discipline (mandatory):** when upgrade succeeds, print the
+  operator-facing summary FIRST, then the success marker, then any
+  cleanup. Order:
+  1. Short human summary line(s) — what changed (image, revision, smoke
+     test result).
+  2. Success marker on its own line:
+     `UPGRADED {{env}} -> <new-image>  (previous: <prev-image>)`
+  3. Cleanup (if any) — the process exits anyway, so it's optional.
+  Never call TaskStop / Monitor cleanup BEFORE step 2; the bash wrapper
+  greps stdout for the marker, and a wedged cleanup before it records
+  the recipe as failed.

@@ -1,0 +1,93 @@
+You are filling in application-specific values in a pre-built Terragrunt +
+Terraform skeleton. The skeleton has already been copied and `{{vars}}` from
+`{{vars_yaml}}` have already been substituted by the framework. Your job is to
+finish the parts that depend on application context which the variable file
+cannot express by itself.
+
+## Inputs
+
+- Repository name: {{repo_name}}
+- Repository source (read-only): {{source_path}}
+- Repository overview (already generated): {{overview_path}}
+- Selected skeleton id: {{skeleton_id}}
+- Rendered IaC directory (writable): {{iac_dir}}
+- Project state file (read-only): {{state_yaml}}
+- Variable file used for skeleton render (read-only): {{vars_yaml}}
+- AWS region: {{region}}
+- Environment: {{env}}
+- **TODO worklist (advisory):** {{todo_list_path}}
+  The framework grep'd `TODO(devops-ai)` markers across the rendered
+  IaC tree as a starting hint. You are NOT required to use this list —
+  if you find more markers by looking yourself, resolve those too. If a
+  marker has been resolved before reaching it, that's fine.
+
+## Task
+
+**Goal:** make `{{iac_dir}}` ready for `terragrunt run-all plan` against
+AWS account in {{region}}/{{env}}. Concretely: every `TODO(devops-ai)`
+marker must be resolved with values that are correct for *this*
+application (not generic placeholders), the IaC must be `terragrunt hcl
+format`-clean, and any resolved value should be traceable back to either
+the repository overview, the inputs.yaml, or live AWS state queryable
+via the `terraform` MCP.
+
+You have a 1M-token context, the `text_editor` tool for reading and
+writing files, and the `terraform` MCP for live registry/module docs.
+The `developer` extension lets you run grep/find/terragrunt/etc. as
+needed. Use them however you see fit. Suggested approach (not
+mandatory):
+
+1. Read the overview ({{overview_path}}) and inputs.yaml ({{vars_yaml}})
+   so you have the application facts in working memory.
+2. Inspect the IaC tree at {{iac_dir}} — note the structure of `environments/`
+   (per-env terragrunt configs) vs `_envcommon/` (shared), and which
+   units are wired together via `dependency` blocks.
+3. Find every `TODO(devops-ai)` marker (the framework's prep file
+   {{todo_list_path}} is a starting list; verify it's still complete).
+4. For each marker, read enough surrounding context (the whole file,
+   neighbouring units it depends on) to make a correct, internally
+   consistent resolution — not a syntactic str_replace.
+5. Apply the edits via `text_editor str_replace` (or `text_editor write`
+   when restructuring blocks).
+6. Run `terragrunt hcl format --working-dir {{iac_dir}}/environments` once.
+7. Verify: `grep -rn 'TODO(devops-ai)' {{iac_dir}}` should return zero
+   results in real HCL/TF files (false-positives in the worklist
+   tracking file are fine — explicitly note them).
+8. Brief summary: one line per file you edited explaining WHY (not
+   just what), then the success marker on its own line.
+
+## What goes in each TODO type
+
+- `_envcommon/secrets.hcl` `secret_keys = [...]` — list every secret name
+  from the overview's "Configuration" section that is marked sensitive
+  (passwords, tokens, client secrets). One key per line. Each becomes a
+  Secrets Manager entry named `{{repo_name}}/{{env}}/<KEY>` in
+  region `{{region}}`.
+- `_envcommon/ecs-service.hcl` `environment = [...]` — copy non-sensitive
+  env vars from the overview (DB_HOST, DB_PORT, REDIS_URL, API_PORT, etc.)
+  as `{ name = "...", value = "" }`. Use empty string for values the
+  operator must fill at deploy time.
+- `_envcommon/ecs-service.hcl` `secrets = [...]` — for every entry in
+  `secret_keys` above, add `{ name = "<KEY>", valueFrom =
+  lookup(dependency.secrets.outputs.secret_arns_by_key, "<KEY>", "") }`.
+- `_envcommon/alb.hcl` `certificate_arn = ""` — leave empty if
+  `domain_name` in inputs.yaml is empty (dev). Otherwise leave the
+  TODO and note in your summary that the operator must issue an ACM
+  cert and paste the ARN before `deploy-infra`.
+
+## Constraints
+
+- **Stay inside `{{iac_dir}}`** for writes. The only places you may
+  write are files inside that directory. Reading the source repo and
+  overview is fine and encouraged.
+- Use as many tool calls as you need to be correct — Opus 4.7 has
+  ample context, and a wrong IaC value caught at apply costs more than
+  five extra reads now.
+- Output language for any new comments / doc: **English only**.
+- Never write real secret values into HCL. Always reference Secrets Manager.
+- Never invent module sources. If a feature needs a module not present in the
+  skeleton, stop and report the gap rather than hand-writing resources.
+- Do not run `apply`, `destroy`, or `plan -auto-approve`. Validation only.
+- If anything in the overview contradicts the skeleton (e.g. overview says
+  MySQL but skeleton wires Postgres), stop and report the conflict.
+- When done, print one line: `IAC READY {{iac_dir}}` and stop.

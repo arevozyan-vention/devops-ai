@@ -1,0 +1,33 @@
+# devops-ai-ui — one-shot stack.
+# Mounts your host's Claude OAuth (~/.claude), AWS creds (~/.aws), source repos
+# (read-only) and a local workspace for projects/ artifacts. Docker socket is
+# mounted so deploy-app can build & push images without docker-in-docker.
+services:
+  ui:
+    build: .
+    image: devops-ai-ui:latest
+    container_name: devops-ai-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - DEVOPS_AI_ROOT=/workspace
+      - FRAMEWORK_DIR=/workspace/framework
+      # Allow Goose's claude-acp to use bypassPermissions while we run as
+      # root inside the container (claude-agent-acp gates this mode behind
+      # IS_SANDBOX env to prevent accidental root-shell autoexec on the host).
+      - IS_SANDBOX=1
+    volumes:
+      # Claude subscription auth (Max plan OAuth) — read-write so token rotation works
+      - ${HOME}/.claude:/root/.claude
+      # AWS credentials — UI can also overwrite via the Setup tab
+      - ${HOME}/.aws:/root/.aws
+      # Persistent project state outside the image (state.yaml, generated
+      # iac/, deploy outputs). Survives container rebuild.
+      - ./projects:/workspace/projects
+      # Application source repos you want to deploy. Drop folders here on
+      # the host and they'll show up in the UI's "+ New project" dropdown.
+      # Read-only — the framework never modifies your source.
+      - ./sources:/workspace/sources:ro
+      # Docker socket so deploy-app's `docker buildx ... --push` works
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

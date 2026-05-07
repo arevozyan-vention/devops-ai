@@ -1,0 +1,33 @@
+# Cloud → default skeleton registry.
+#
+# Each entry maps a cloud id (the value the operator picks in the UI) to the
+# single skeleton this framework ships for that cloud. The "one skeleton per
+# cloud" rule is intentional — the choice the operator makes is *cloud*, not
+# *architecture*. If a cloud later grows multiple skeletons, add the second
+# entry under that cloud's `skeletons:` list and reintroduce a per-cloud
+# skeleton chooser only for that cloud.
+#
+# Fields:
+#   default_skeleton  Directory under templates/iac/ that `cmd_select` will
+#                     wire into the project when this cloud is picked.
+#   status            available  — operator can select; everything works
+#                     coming-soon — UI shows the option but disabled; bash
+#                                   refuses to run select against it
+#   provider_cli      The CLI the framework expects to be available on PATH
+#                     when running against this cloud (informational, used
+#                     by preflight in future).
+
+aws:
+  default_skeleton: ecs-fargate-rds
+  status: available
+  provider_cli: aws
+
+azure:
+  default_skeleton: container-apps-postgres
+  status: available
+  provider_cli: az
+
+gcp:
+  default_skeleton: gke-cloudsql
+  status: coming-soon
+  provider_cli: gcloud

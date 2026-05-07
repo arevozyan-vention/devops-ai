@@ -1,0 +1,145 @@
+You are applying AWS infrastructure that has already been planned and
+human-approved via the framework's bash gate. You must NOT re-prompt for
+approval — the operator already typed `apply` (or `apply prod`) outside this
+recipe; you would not see the answer if you asked again. Just apply.
+
+## Inputs
+
+- Repository name: {{repo_name}}
+- IaC directory: {{iac_dir}}
+- Environment: {{env}}             # dev | stage | prod
+- AWS region: {{region}}
+- Plan summary (already approved by operator): {{plan_summary_path}}
+- Outputs file (you must write this): {{outputs_path}}
+
+## Terragrunt 1.x (stargazer) CLI cheatsheet
+
+The framework runs Terragrunt 1.x. Many legacy `--terragrunt-*` flags have
+been renamed or removed. Use only what is below.
+
+KNOWN-GOOD INVOCATIONS:
+- `terragrunt run --all apply --non-interactive`
+- `terragrunt run --all output --non-interactive`
+- `terragrunt force-unlock <LOCK_ID>`        (positional id only — no `--force`)
+- `terragrunt --working-dir <unit-dir> apply` (single-unit form)
+
+PASSING TERRAFORM FLAGS:
+Terraform-specific flags (`-json`, `-lock=false`, `-refresh=false`) MUST come
+after a literal `--` separator.
+  GOOD: `terragrunt run --all output --non-interactive -- -json > {{outputs_path}}`
+
+FLAGS THAT NO LONGER EXIST (do not invent them):
+- `--terragrunt-include-external-dependencies`
+- `--terragrunt-non-interactive`     (just `--non-interactive`)
+- `--terragrunt-parallelism`         (use `TG_PARALLELISM` env var)
+- `--force` on `force-unlock`
+
+IF YOU SEE `flag provided but not defined` or `is not a valid flag for ...`,
+STOP. Re-read this cheatsheet. Do NOT retry the same command verbatim.
+
+TIMEOUTS: a full `--all apply` for ~10 modules on a cold cache can take
+10-25 minutes (RDS alone can be 5-10 min), and local-model latency can stretch
+wall time further. Set `timeout_secs=6000` on every shell call that runs
+terragrunt. If Goose rejects this value as too large, fall back to
+`timeout_secs=3600` and report the rejection in your next message — do not
+silently drop to a smaller number.
+
+## DO NOT use Monitor / background tail for `terragrunt apply`
+
+`terragrunt run --all apply` has a definite end (the process exits when the
+last unit finishes or fails). Run it **synchronously** as a single shell
+call with a generous `timeout_secs`. Do NOT pipe its log into a `tail -F`
+under Monitor or under `run_in_background` — by the time your tail starts,
+the apply may have already printed its completion lines, and the tail will
+hang forever waiting for new lines that never come. Several real runs have
+been wedged this way for 30+ minutes after the apply itself finished.
+
+Synchronous form (the only correct form for this recipe):
+```
+cd <iac_dir>/environments/<env> && \
+  TG_PARALLELISM=1 terragrunt run --all apply --non-interactive
+```
+Wait for it to return. Read the exit code. Done.
+
+## Task
+
+1. Confirm AWS identity:
+   ```
+   aws sts get-caller-identity
+   ```
+   Compare the account id and ARN to the values recorded at the top of
+   `{{plan_summary_path}}`. If they differ, STOP — do not apply against a
+   different account than the one the operator approved.
+
+2. `cd {{iac_dir}}/environments/{{env}}` and run apply:
+   ```
+   terragrunt run --all apply --non-interactive
+   ```
+   Terragrunt walks the dependency graph automatically (vpc → secrets / iam /
+   ecr / rds-sg / ecs-cluster → alb / rds → ecs-service). Units that were
+   "Deferred to apply" in the plan summary will plan + apply here once their
+   dependencies are real.
+
+3. If apply fails part-way through, do NOT run `destroy`. Do NOT run `apply`
+   a second time blindly. Report the failed units and the verbatim error and
+   stop. The operator will decide whether to retry, fix manually, or roll
+   back the partial creation.
+
+4. Outputs collection is **not your job**. The framework wrapper
+   (`merge_terragrunt_outputs` in `lib/outputs.sh`) iterates units and
+   produces a correctly-merged `{{outputs_path}}` AFTER you emit the
+   success marker. The legacy `terragrunt run --all output -- -json >
+   {{outputs_path}}` invocation is broken (per-unit JSON gets concatenated,
+   invalid as a single document) and must NOT be used here. Just don't
+   touch the outputs file.
+
+5. **Print the operator-facing summary FIRST**, then the success marker.
+   The bash wrapper greps stdout for `INFRA DEPLOYED`. If you stop
+   without printing it (e.g. wedged on a Monitor cleanup), the recipe
+   is recorded as failed even though the apply succeeded. Real incident:
+   a successful greenfield apply was marked failed because the model
+   tried to stop a Monitor before emitting the marker and never reached
+   it.
+
+   Order of stdout output:
+
+   a. Apply summary line — count of units that succeeded vs. failed,
+      taken verbatim from terragrunt's "Run Summary" stdout. Do NOT
+      fabricate endpoints — those will be filled in by the framework
+      wrapper from real terragrunt output.
+
+   b. Immediately after (a), print the success marker on its own line:
+      ```
+      INFRA DEPLOYED env={{env}} region={{region}}
+      ```
+
+   c. After (b), cleanup is optional — the goose process exits and any
+      leftover Monitor / background tail dies with it. If you must stop
+      a Monitor, do so AFTER (b), never before. A stuck cleanup tool
+      after the marker is harmless; a stuck cleanup tool before the
+      marker invalidates the whole recipe.
+
+## Constraints
+
+- **No re-approval prompts.** The bash gate already happened. Do not write
+  "Type apply to proceed" or any equivalent. The operator is not connected
+  to your stdin.
+
+- **Anti-hallucination.** Do not write to `{{outputs_path}}`. The
+  framework wrapper handles it after you exit. Never fabricate ARNs,
+  endpoints, or IDs in your stdout either.
+
+- **Account safety.** If AWS identity in step 1 does not match the account
+  the plan was approved against, STOP without applying.
+
+- **Production extra care.** For `{{env}} == prod`, if any unit shows destroy
+  or replacement of stateful resources (RDS, secrets) at apply time, STOP and
+  report.
+
+- **No destroy on failure.** If apply fails partway, never run `destroy` or
+  `state rm`. Report and stop.
+
+- Output language: **English only**.
+
+- When done successfully, print exactly: `INFRA DEPLOYED env={{env}} region={{region}}`
+  and stop.

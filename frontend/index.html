@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DevOps AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@14.1.3/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5.6.1/github-markdown-light.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+<div class="max-w-7xl mx-auto p-6">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between mb-6">
+    <h1 class="text-2xl font-bold">DevOps AI <span class="text-slate-400 text-sm font-normal">— Web UI</span></h1>
+    <div id="auth-status" class="flex gap-3 text-sm">
+      <span id="aws-badge"    class="px-3 py-1 rounded-full bg-slate-200">AWS: …</span>
+      <span id="azure-badge"  class="px-3 py-1 rounded-full bg-slate-200">Azure: …</span>
+      <span id="claude-badge" class="px-3 py-1 rounded-full bg-slate-200">Claude: …</span>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="flex gap-2 border-b mb-4">
+    <button data-tab="setup"    class="tab-btn px-4 py-2 border-b-2 border-transparent">Setup</button>
+    <button data-tab="projects" class="tab-btn px-4 py-2 border-b-2 border-transparent active-tab">Projects</button>
+    <button data-tab="project"  class="tab-btn px-4 py-2 border-b-2 border-transparent hidden" id="project-tab-btn">Project</button>
+  </nav>
+
+  <!-- ──────────────  SETUP TAB  ────────────── -->
+  <section data-pane="setup" class="hidden">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
+      <!-- AWS creds -->
+      <div class="bg-white p-5 rounded-lg shadow-sm border">
+        <h2 class="font-semibold mb-3">AWS Credentials</h2>
+        <p class="text-xs text-slate-500 mb-3">
+          Stored to <code>~/.aws/credentials</code> inside the container. If you
+          mounted <code>~/.aws/</code> from your host, this overwrites it.
+        </p>
+        <form id="aws-form" class="space-y-2">
+          <input name="access_key_id" placeholder="AWS_ACCESS_KEY_ID" required
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="secret_access_key" placeholder="AWS_SECRET_ACCESS_KEY" required
+                 type="password"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="session_token" placeholder="AWS_SESSION_TOKEN (optional)"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="region" placeholder="region" value="us-east-1" required
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="expected_account_id" placeholder="Expected AWS account ID (optional, 12 digits)"
+                 pattern="\d{12}"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <p class="text-xs text-slate-400">If provided, we'll compare this against
+            <code>aws sts get-caller-identity</code> and warn on mismatch.
+            Auto-detected if you leave it blank.</p>
+          <button class="bg-blue-600 text-white px-4 py-2 rounded text-sm">Save & verify</button>
+        </form>
+        <div id="aws-result" class="mt-3 text-sm font-mono"></div>
+      </div>
+
+      <!-- Azure creds -->
+      <div class="bg-white p-5 rounded-lg shadow-sm border">
+        <h2 class="font-semibold mb-3">Azure Credentials</h2>
+        <p class="text-xs text-slate-500 mb-3">
+          Service Principal recommended (admin user with MFA can't login in
+          a headless container). Create one with
+          <code>az ad sp create-for-rbac --role Owner --scopes /subscriptions/&lt;sub&gt;</code>
+          on your local machine, then paste the four values below.
+        </p>
+        <form id="azure-form" class="space-y-2">
+          <input name="tenant_id" placeholder="Tenant ID (UUID)" required
+                 pattern="[0-9a-fA-F-]{36}"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="subscription_id" placeholder="Subscription ID (UUID)" required
+                 pattern="[0-9a-fA-F-]{36}"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="client_id" placeholder="Client ID (= appId from sp create-for-rbac)" required
+                 pattern="[0-9a-fA-F-]{36}"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="client_secret" placeholder="Client Secret (= password from sp create-for-rbac)" required
+                 type="password"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="region" placeholder="default Azure location" value="eastus"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <input name="expected_subscription_id" placeholder="Expected subscription ID (optional, sanity check)"
+                 pattern="[0-9a-fA-F-]{36}"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <p class="text-xs text-slate-400">If provided, we'll compare this against
+            <code>az account show</code> and warn on mismatch.</p>
+          <button class="bg-blue-600 text-white px-4 py-2 rounded text-sm">Save &amp; az login</button>
+        </form>
+        <div id="azure-result" class="mt-3 text-sm font-mono"></div>
+      </div>
+
+      <!-- Claude / Anthropic — two paths -->
+      <div class="bg-white p-5 rounded-lg shadow-sm border md:col-span-2">
+        <h2 class="font-semibold mb-1">Claude (Anthropic) Authentication</h2>
+        <p class="text-xs text-slate-500 mb-3">
+          Two paths — pick whichever billing you already pay for.
+          Goose's provider switches automatically when you activate one.
+        </p>
+        <div id="claude-detail" class="text-sm font-mono mb-3"></div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+          <!-- Path A: Max subscription — in-UI OAuth wizard -->
+          <div class="border rounded p-4 bg-slate-50">
+            <div class="flex justify-between items-start mb-2">
+              <h3 class="font-medium">A · Claude Max subscription</h3>
+              <span id="sub-status" class="text-xs px-2 py-0.5 rounded-full bg-slate-200">…</span>
+            </div>
+            <p class="text-xs text-slate-600 mb-3">
+              Flat <strong>$100/mo</strong>, no per-token cost. Logs in
+              against your Anthropic account through OAuth — completely
+              inside this UI.
+            </p>
+            <div class="flex gap-2">
+              <button id="oauth-start"
+                      class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm flex-1">
+                Sign in with Claude
+              </button>
+              <button id="claude-recheck" type="button"
+                      class="bg-slate-200 hover:bg-slate-300 px-3 py-1.5 rounded text-sm">Re-check</button>
+            </div>
+            <div id="sub-result" class="mt-2 text-xs"></div>
+          </div>
+
+          <!-- Path B: API key -->
+          <div class="border rounded p-4 bg-slate-50">
+            <div class="flex justify-between items-start mb-2">
+              <h3 class="font-medium">B · Anthropic API key</h3>
+              <span id="key-status" class="text-xs px-2 py-0.5 rounded-full bg-slate-200">…</span>
+            </div>
+            <p class="text-xs text-slate-600 mb-3">
+              Pay-per-token from
+              <a href="https://console.anthropic.com/settings/keys" target="_blank"
+                 class="text-blue-600 hover:underline">console.anthropic.com</a>.
+              <strong>Not</strong> covered by Max subscription — separate billing.
+            </p>
+            <form id="anthropic-key-form" class="space-y-2">
+              <input name="api_key" type="password" autocomplete="off"
+                     placeholder="sk-ant-api03-..." required
+                     class="w-full border rounded px-3 py-2 text-sm font-mono">
+              <div class="flex gap-2">
+                <button class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm flex-1">Save &amp; verify</button>
+                <button id="anthropic-key-clear" type="button"
+                        class="bg-slate-200 hover:bg-slate-300 px-3 py-1.5 rounded text-sm">Clear</button>
+              </div>
+            </form>
+            <div id="anthropic-key-result" class="mt-2 text-xs"></div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── OAuth WIZARD MODAL (Path A) ─────────────────────────── -->
+    <div id="oauth-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center hidden z-50">
+      <div class="bg-white rounded-lg w-full max-w-md p-6">
+        <div class="flex justify-between items-start mb-3">
+          <h3 class="font-semibold">Sign in with Claude</h3>
+          <button id="oauth-close" class="text-slate-500 hover:text-slate-800 text-2xl leading-none">&times;</button>
+        </div>
+
+        <!-- Step 1: connecting -->
+        <div data-oauth-step="connecting">
+          <div class="flex items-center gap-3 text-sm text-slate-600 mb-3">
+            <div class="animate-spin border-2 border-blue-600 border-t-transparent rounded-full w-5 h-5"></div>
+            <div>Starting <code>claude</code>… preparing OAuth URL.</div>
+          </div>
+        </div>
+
+        <!-- Step 2: URL ready -->
+        <div data-oauth-step="url_ready" class="hidden">
+          <p class="text-sm text-slate-700 mb-3">
+            <strong>Step 1.</strong> Open this URL in your browser and complete
+            login on Anthropic. They'll show you a verification code.
+          </p>
+          <a id="oauth-url" target="_blank" rel="noopener noreferrer"
+             class="block w-full bg-blue-600 hover:bg-blue-700 text-white text-center px-4 py-2 rounded text-sm font-medium mb-2">
+             🔗 Open Anthropic login
+          </a>
+          <details class="text-xs text-slate-500 mb-3">
+            <summary class="cursor-pointer hover:text-slate-700">browser didn't open? show URL</summary>
+            <pre id="oauth-url-text" class="mt-1 break-all whitespace-pre-wrap bg-slate-100 p-2 rounded font-mono"></pre>
+          </details>
+          <p class="text-sm text-slate-700 mb-2">
+            <strong>Step 2.</strong> Paste the verification code Anthropic shows:
+          </p>
+          <form id="oauth-code-form" class="flex gap-2">
+            <input id="oauth-code-input" autocomplete="off"
+                   placeholder="paste code here"
+                   class="flex-1 border rounded px-3 py-2 text-sm font-mono">
+            <button class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">Submit</button>
+          </form>
+          <div data-oauth-substep="waiting" class="mt-2 text-xs text-slate-500 hidden">
+            ✓ Got it — claude is asking for the code now.
+          </div>
+        </div>
+
+        <!-- Step 3: verifying -->
+        <div data-oauth-step="verifying" class="hidden">
+          <div class="flex items-center gap-3 text-sm text-slate-600">
+            <div class="animate-spin border-2 border-blue-600 border-t-transparent rounded-full w-5 h-5"></div>
+            <div>Verifying code with Anthropic…</div>
+          </div>
+        </div>
+
+        <!-- Step 4: success -->
+        <div data-oauth-step="success" class="hidden">
+          <div class="text-green-700 font-medium mb-2">✓ Logged in!</div>
+          <p class="text-sm text-slate-600 mb-3">
+            Goose can now use your Claude Max subscription. Closing this dialog
+            switches the active provider to <code>claude-acp</code>.
+          </p>
+          <button id="oauth-finish" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm w-full">Done</button>
+        </div>
+
+        <!-- Step 5: failed -->
+        <div data-oauth-step="failed" class="hidden">
+          <div class="text-red-700 font-medium mb-2">✗ Login failed</div>
+          <p id="oauth-fail-reason" class="text-xs text-slate-600 mb-3"></p>
+          <div class="flex gap-2">
+            <button id="oauth-retry" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm flex-1">Try again</button>
+            <button id="oauth-close-failed" class="bg-slate-200 hover:bg-slate-300 px-4 py-2 rounded text-sm">Close</button>
+          </div>
+        </div>
+
+        <!-- Always-visible debug log (collapsed by default) -->
+        <details class="mt-4 text-xs text-slate-500">
+          <summary class="cursor-pointer hover:text-slate-700">debug: raw output from claude</summary>
+          <pre id="oauth-debug" class="mt-2 bg-slate-900 text-slate-100 p-2 rounded text-[11px] font-mono whitespace-pre-wrap max-h-60 overflow-auto"></pre>
+        </details>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ──────────────  PROJECTS TAB  ────────────── -->
+  <section data-pane="projects">
+    <div class="flex justify-between items-center mb-4">
+      <h2 class="font-semibold">Projects</h2>
+      <button id="new-project-btn" class="bg-blue-600 text-white px-4 py-2 rounded text-sm">＋ New project</button>
+    </div>
+    <div id="projects-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+
+    <!-- Init-project modal -->
+    <div id="init-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center hidden z-50">
+      <div class="bg-white p-6 rounded-lg w-full max-w-lg">
+        <h3 class="font-semibold mb-3">Initialize a new project</h3>
+        <p class="text-xs text-slate-500 mb-3">
+          Pick a source repository. The dropdown shows folders inside
+          <code>devops-ai-ui/sources/</code> on your host. To add a new
+          one, just drop (or clone) the repo there and click "+ New
+          project" again.
+        </p>
+        <form id="init-form" class="space-y-2">
+          <label class="block text-xs text-slate-600">Source repository</label>
+          <select id="init-source-select" name="source_path" required
+                  class="w-full border rounded px-3 py-2 text-sm font-mono">
+            <option value="">— loading… —</option>
+          </select>
+          <label class="block text-xs text-slate-600 pt-2">Project name</label>
+          <input name="name" placeholder="project-name (alnum, ., -, _)" required
+                 pattern="[A-Za-z0-9._-]+"
+                 class="w-full border rounded px-3 py-2 text-sm font-mono">
+          <p class="text-xs text-slate-400">Auto-filled from the source dir name; you can override.</p>
+          <label class="block text-xs text-slate-600 pt-2">Target cloud</label>
+          <select id="init-cloud-select" name="cloud" required
+                  class="w-full border rounded px-3 py-2 text-sm font-mono">
+            <option value="" disabled>— loading… —</option>
+          </select>
+          <p class="text-xs text-slate-400">
+            Drives every recipe + MCP + identity check. Coming-soon entries
+            are disabled. You can override later via <code>select --cloud …</code>
+            but assess/recommend will already be tailored to the cloud you
+            pick here.
+          </p>
+          <div class="flex gap-2 pt-2">
+            <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded text-sm flex-1">Initialize</button>
+            <button type="button" id="init-cancel" class="bg-slate-200 px-4 py-2 rounded text-sm">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ──────────────  PROJECT DETAIL TAB  ────────────── -->
+  <section data-pane="project" class="hidden">
+    <button id="back-to-projects" class="text-sm text-blue-600 mb-3">← back to projects</button>
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <!-- Left: project header + steps -->
+      <div class="lg:col-span-2 space-y-4">
+        <div class="bg-white p-5 rounded-lg shadow-sm border" id="project-header"></div>
+        <div class="bg-white p-5 rounded-lg shadow-sm border">
+          <h3 class="font-semibold mb-3">Workflow steps</h3>
+          <div id="steps-list" class="space-y-2"></div>
+        </div>
+        <!-- Live log -->
+        <div class="bg-slate-900 text-slate-100 rounded-lg p-4 font-mono text-xs h-96 overflow-auto" id="log-pane">
+          <div class="text-slate-500">Logs will stream here once you run a step.</div>
+        </div>
+      </div>
+
+      <!-- Right: artifacts + danger zone -->
+      <div class="space-y-4">
+        <div class="bg-white p-5 rounded-lg shadow-sm border">
+          <h3 class="font-semibold mb-3">Artifacts</h3>
+          <div id="artifacts-list" class="space-y-1 text-sm"></div>
+        </div>
+
+        <!-- Danger zone — shown only when infra_deployed && env=dev -->
+        <div id="danger-zone" class="bg-red-50 border border-red-200 p-5 rounded-lg hidden">
+          <h3 class="font-semibold mb-2 text-red-700">⚠ Danger zone</h3>
+          <p class="text-xs text-slate-600 mb-3">
+            Destroy runs <code>terragrunt run-all destroy</code> on this
+            project's environment. <strong>All AWS resources (VPC, RDS,
+            ECS, ALB, secrets, IAM, ECR images) will be deleted.</strong>
+            Not reversible beyond redeploying from scratch.
+          </p>
+          <button id="destroy-btn"
+                  class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm w-full">
+            Destroy infrastructure
+          </button>
+          <p id="destroy-disabled-reason" class="text-xs text-slate-500 mt-2 hidden"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step-action modal (e.g. select with skeleton/region/env) -->
+    <div id="step-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center hidden z-50">
+      <div class="bg-white p-6 rounded-lg w-full max-w-md">
+        <h3 id="step-modal-title" class="font-semibold mb-3"></h3>
+        <div id="step-modal-body"></div>
+      </div>
+    </div>
+
+    <!-- Destroy confirmation modal -->
+    <div id="destroy-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center hidden z-50">
+      <div class="bg-white rounded-lg w-full max-w-md p-6">
+        <h3 class="font-semibold mb-2 text-red-700">⚠ Destroy infrastructure</h3>
+        <p class="text-sm text-slate-700 mb-3">
+          This will <strong>permanently delete</strong> all AWS resources
+          for project <code id="destroy-project-name" class="font-mono"></code>.
+          Backups, snapshots, ECR images, secrets — all gone.
+        </p>
+        <p class="text-sm text-slate-700 mb-3">
+          To confirm, type the project name below:
+        </p>
+        <input id="destroy-confirm-input" autocomplete="off"
+               class="w-full border rounded px-3 py-2 text-sm font-mono mb-3"
+               placeholder="project name">
+        <div class="flex gap-2">
+          <button id="destroy-cancel" type="button"
+                  class="flex-1 bg-slate-200 hover:bg-slate-300 px-4 py-2 rounded text-sm">
+            Cancel
+          </button>
+          <button id="destroy-confirm" type="button" disabled
+                  class="flex-1 bg-red-600 text-white px-4 py-2 rounded text-sm disabled:opacity-40 disabled:cursor-not-allowed">
+            Destroy
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- File-viewer modal -->
+    <div id="file-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center hidden z-50">
+      <div class="bg-white p-6 rounded-lg w-full max-w-4xl max-h-[90vh] flex flex-col">
+        <div class="flex justify-between items-center mb-3">
+          <h3 id="file-modal-title" class="font-semibold font-mono text-sm"></h3>
+          <button id="file-modal-close" class="text-slate-500 hover:text-slate-800 text-2xl leading-none">&times;</button>
+        </div>
+        <pre id="file-modal-body" class="flex-1 overflow-auto bg-slate-50 p-3 text-xs font-mono whitespace-pre-wrap"></pre>
+      </div>
+    </div>
+  </section>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

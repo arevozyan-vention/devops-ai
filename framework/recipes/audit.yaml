@@ -1,0 +1,100 @@
+# Goose recipe: drift / posture audit of deployed AWS resources vs IaC.
+# Run periodically (weekly, monthly) on existing projects.
+version: "1.0.0"
+title: "Audit deployed infrastructure"
+description: "Compare live AWS resources against IaC + state, flag drift, unused resources, security drift."
+temperature: 0.2
+max_turns: 80
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name."
+  - key: iac_dir
+    input_type: string
+    requirement: required
+    description: "Absolute path to the rendered Terragrunt project (the 'desired' state)."
+  - key: outputs_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to deploy/outputs.json from the last apply."
+  - key: output_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to docs/02_audit.md to write."
+  - key: state_yaml
+    input_type: string
+    requirement: required
+    description: "Absolute path to the project's state.yaml."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are a senior SRE auditing the gap between the IaC-declared state
+  of an AWS deployment and what's actually running.
+
+  ## Inputs
+
+  - IaC tree (desired state): {{ iac_dir }}
+  - Last-known outputs: {{ outputs_path }}
+  - Project state: {{ state_yaml }}
+  - Report output: {{ output_path }}
+
+  ## Goal
+
+  Run a posture review of the deployed resources. The `aws-api` MCP
+  and `terraform` MCP are enabled — use them to query reality.
+
+  ## What to check
+
+  - **Configuration drift**: a resource that exists in IaC but its
+    live AWS attributes differ from what `terragrunt plan` would set.
+    For each, name the resource, attribute, and the gap.
+  - **Orphan resources**: things in the project's prefix/tag namespace
+    in AWS that are not in the IaC. They may be leftovers from a failed
+    apply, manual debugging, or destroy that didn't finish.
+  - **Stale tags / missing tags**: resources missing the project tag
+    schema declared in `_envcommon`.
+  - **Security drift**: SGs or IAM roles widened compared to IaC,
+    bucket policies changed, secrets rotated outside the framework.
+  - **Cost smell**: idle resources (NAT GW with no flows, RDS at
+    near-zero CPU sized for prod, ECR repos with no recent pulls,
+    log groups with retention=never on large volume).
+  - **Compliance posture**: backup snapshots present? CloudTrail on?
+    VPC Flow Logs on? Multi-AZ where prod was promised?
+
+  ## Required output structure ({{ output_path }}, Markdown)
+
+  ```
+  # Audit — {{ repo_name }}
+
+  ## Verdict
+  [ ] In sync / no action needed
+  [ ] Drift found — review below
+  [ ] Critical issues — needs immediate action
+
+  ## Drift table
+  | Resource | Type | Attribute | IaC says | AWS says | Severity |
+
+  ## Orphan resources
+  | Resource | First seen | Why probably here | Suggested action |
+
+  ## Security findings
+  - bullet list of security drift, each with file:line in IaC and ARN/ID
+
+  ## Cost findings
+  - bullet list with monthly $ cost of idle resources
+
+  ## Compliance posture
+  - backups, CloudTrail, Flow Logs, multi-AZ — present? aligned with
+    what the overview promised in the corresponding env?
+
+  ## Recommended next steps
+  - prioritised list of fixes
+  ```
+
+  ## Constraints
+
+  - **Read-only**: do not run any apply/destroy. No mutations.
+  - English only.
+  - When done, print one line: `WROTE {{ output_path }}` and stop.

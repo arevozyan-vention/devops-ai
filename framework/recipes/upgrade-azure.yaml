@@ -1,0 +1,59 @@
+# Goose recipe: roll out a new image to an existing Azure Container App.
+# Mirror of recipes/upgrade.yaml. Stricter than deploy-app: requires clean
+# git tree, presents a plan summary (current vs new image), and stops on
+# smoke-test failure rather than rolling back automatically.
+version: "1.0.0"
+title: "Upgrade application (Azure)"
+description: "Build + push + Container App revision rollout. No auto-rollback on failure."
+temperature: 0.1
+max_turns: 80
+parameters:
+  - { key: repo_name,    input_type: string, requirement: required, description: "Project name." }
+  - { key: source_path,  input_type: string, requirement: required, description: "Absolute path to repo source tree." }
+  - { key: git_ref,      input_type: string, requirement: required, description: "Branch / tag / SHA to deploy." }
+  - { key: region,       input_type: string, requirement: required, description: "Azure region (eastus, etc.)." }
+  - { key: env,          input_type: string, requirement: required, description: "Environment (dev for now)." }
+  - { key: outputs_path, input_type: string, requirement: required, description: "Path to deploy/outputs.json with infra endpoints." }
+  - { key: history_path, input_type: string, requirement: required, description: "Append-only deploy/history.jsonl for rollout records." }
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  Roll out a new image to an existing Azure Container App.
+
+  ## Inputs
+  - Project: {{ repo_name }}     Source: {{ source_path }}     Ref: {{ git_ref }}
+  - Env: {{ env }}     Region: {{ region }}
+  - Infra outputs: {{ outputs_path }}
+  - History (append): {{ history_path }}
+
+  ## Steps
+
+  1. Verify Azure identity (`az account show`) and ACR access
+     (`az acr login --name <acr>`).
+  2. Refuse if working tree dirty: `git -C {{ source_path }} status --porcelain`.
+     For prod env, refuse if working tree differs from `{{ git_ref }}`.
+  3. Print a plan summary table to stdout:
+     `current_image | new_image | container_app | resource_group`
+     For prod, REQUIRE the operator approval phrase `apply prod` in stdin
+     (read with `read -r`); on dev, no extra gate (the bash gate already happened).
+  4. Build + push for `linux/amd64`:
+     `docker buildx build --platform linux/amd64 --target run -t <acr>/<repo>:<sha> --push <source>`
+  5. Update Container App: `az containerapp update -n <app> -g <rg> --image <acr>/<repo>:<sha>`
+  6. Wait for new revision Provisioned + Running + traffic 100% (poll
+     `az containerapp revision list`, max 10 min).
+  7. Smoke test: `curl -fsS https://<fqdn><health_path>`
+     - 2xx → success.
+     - non-2xx → STOP. Do NOT auto-rollback. Print failure summary
+       indicating the revision is still serving traffic; operator runs
+       `rollback` if they want to revert.
+  8. Append to `{{ history_path }}`:
+     `{"ts": ..., "git_sha": ..., "image": ..., "result": "success"|"failed", "cloud": "azure"}`
+
+  ## Output discipline (mandatory)
+
+  When successful, print FIRST a 1-2 line summary, THEN the marker on its
+  own line, THEN any cleanup. Marker:
+  `UPGRADED {{ env }} -> <acr>/<repo>:<sha>  (previous: <prev-image>)`
+
+  Never call TaskStop / Monitor cleanup before printing the marker.

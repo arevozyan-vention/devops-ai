@@ -1,0 +1,552 @@
+You are deploying an application to already-provisioned AWS infrastructure.
+This step does PROACTIVE preparation (read app contracts, pre-fix obvious
+mismatches), builds container images, pushes them to ECR, updates ECS
+services, and then runs a SELF-HEALING LOOP that diagnoses and applies safe
+fixes for deploy-time issues — until the application is healthy or until
+the iteration budget is exhausted.
+
+The goal is to make ANY small monorepo with a containerized backend (and
+optional frontend) reachable behind the ALB without operator intervention,
+across whatever stack the source happens to use (Node/Python/Go/Java/Ruby +
+TypeORM/Prisma/Drizzle/Sequelize/Knex/Django/Rails/Alembic).
+
+## Inputs
+
+- Repository name: {{repo_name}}
+- Source code path: {{source_path}}
+- AWS region: {{region}}
+- Environment: {{env}}
+- IaC directory (read-only here): {{iac_dir}}
+- Stack outputs (read-only): {{outputs_path}}
+   JSON from `terragrunt run --all output -json`. Keys are nested by unit
+   name; for the ecs-fargate-rds skeleton expect at least `repository_url`
+   (backend ECR), `cluster_name`, `service_name`, `dns_name` (ALB),
+   `db_instance_address`. With `--include frontend` you also get a second
+   `repository_url` under the `ecr-frontend` unit and a second
+   `service_name` under `ecs-service-frontend`. With `--include redis` you
+   get `primary_endpoint_address`.
+- Deploy history (append-only JSONL): {{history_path}}
+- Self-heal attempts log (append-only Markdown): {{attempts_path}}
+- Failure report (write only on terminal stop): {{failure_report_path}}
+- Git ref to build (optional): {{git_ref}}
+   If empty, build from the current `HEAD` of `{{source_path}}`.
+
+## Phase 1 — Pre-flight (run once, do not loop)
+
+### 1.1 Resolve git SHA
+
+`cd {{source_path}} && git rev-parse --short=12 HEAD`. If the working tree
+is dirty, append `-dirty` to the tag. Do NOT push a dirty tag to `prod`
+without explicit operator confirmation.
+
+### 1.2 Read outputs.json
+
+Pull, for each service that exists:
+- `ecr_repo_url` → backend image registry
+- `ecr_repo_url_frontend` (only if `include_frontend=true`)
+- `ecs_cluster_name`, `ecs_service_name` (backend)
+- `ecs_service_name_frontend` (only if `include_frontend=true`)
+- `alb_dns_name`
+- `log_group_name` per service
+- `db_instance_address` (if RDS)
+- `primary_endpoint_address` (if Redis)
+- `secret_arns_by_key` (map of secret name → ARN)
+- ECS target group ARN(s) for the backend (and frontend, if applicable)
+
+If the keys you need are missing, STOP and write `{{failure_report_path}}`
+with category `Missing infrastructure outputs` — do not enter the loop.
+
+### 1.3 Read inputs.yaml
+
+Capture from `{{iac_dir}}/inputs.yaml`:
+- `include_frontend` (true/false)
+- `container_port`, `frontend_container_port`
+- `health_check_path`, `frontend_health_check_path`
+- `db_name`, `db_master_username`
+
+### 1.4 Locate Dockerfiles + parse multi-stage targets
+
+Convention:
+- Backend: `{{source_path}}/Dockerfile`
+- Frontend: `{{source_path}}/frontend/Dockerfile`
+
+If they're not at the convention path, search up to **5 levels deep**,
+**skipping hidden directories** (`.git`, `.cursor`, `.vscode`, `.idea`,
+`.github`, `node_modules`). Look under common monorepo locations:
+`packages/`, `apps/`, `services/`, `containers/`, `docker/`, `<service-name>/`.
+
+For role assignment when convention path doesn't match, use this priority:
+1. **Stage name match** in a multi-stage Dockerfile (highest priority)
+2. **Dir name match** (the immediate parent dir of the Dockerfile)
+
+Role suffix patterns (case-insensitive, match anywhere in name):
+- backend: `-server`, `-api`, `-back`, `-backend`, `-core`, `-app`,
+  exact: `server`, `api`, `backend`
+- frontend: `-front`, `-frontend`, `-web`, `-ui`, `-client`, `-admin`, `-spa`,
+  exact: `front`, `frontend`, `web`, `client`, `ui`
+
+For EACH candidate Dockerfile, read it and extract:
+
+a) **Multi-stage targets** — every `FROM <base> AS <stage_name>` line.
+   - If at least one stage name matches a role pattern, you'll build with
+     `-f <path> --target <stage_name>`. Build context is the directory you
+     `cd` into for the build — for monorepo Dockerfiles that `COPY ./...`
+     from repo root, build context = `{{source_path}}`.
+   - If NO stages exist (single-stage Dockerfile), build with just
+     `-f <path>` and the dir containing the Dockerfile as build context.
+
+b) **EXPOSE port** — note the port. If it differs from
+   `inputs_yaml.container_port` (backend) or `frontend_container_port`,
+   queue a Phase 1.7 fix.
+
+c) **CMD / ENTRYPOINT** — note what runs at start. If it references an
+   external script (e.g. `ENTRYPOINT ["./entrypoint.sh"]`), read that
+   script too.
+
+If you cannot disambiguate roles (e.g. two plausible backends with no role
+hint, or only one Dockerfile but `include_frontend=true` and no second
+candidate), STOP and write Phase 6 with category
+`Ambiguous monorepo layout`.
+
+### 1.5 Source intelligence — read app contracts
+
+Before building, gather what the app actually expects. **Do this even if
+you think you know the stack** — the savings on the self-heal loop are
+substantial. Read each relevant file you can find; don't fail if any are
+missing.
+
+a) **Env-var contract** — try in order:
+   `.env.example`, `.env.template`, `.env.dist`, `.env.test.example`,
+   `.env.sample`, `apps/*/env.example`, `packages/*/env.example`.
+   Each `KEY=` line is a required-ish env var. Collect ALL keys into a
+   set. Note comments (`# X is required for Y`) — they hint at which are
+   genuinely required vs. optional.
+
+b) **package.json** (root + every package.json found at depth ≤ 5):
+   - `scripts.migrate`, `migrate:run`, `migrate:deploy`, `db:migrate`,
+     `db:setup`, `db:reset` — note exact commands (you may need them in
+     Phase 4.2's migration row).
+   - `dependencies` and `devDependencies` — infer ORM/migration tool:
+     - `typeorm` → `npx typeorm migration:run -d <data-source>`
+     - `@prisma/client` / `prisma` → `npx prisma migrate deploy`
+     - `drizzle-orm` → `npx drizzle-kit migrate`
+     - `knex` → `npx knex migrate:latest`
+     - `sequelize` / `sequelize-cli` → `npx sequelize-cli db:migrate`
+     - `mongoose` → check for migration tool separately
+   - `engines.node` — note for compatibility checks.
+
+c) **entrypoint scripts** — if Dockerfile `ENTRYPOINT` or `CMD` references
+   one (`entrypoint.sh`, `start.sh`, `init.sh`, `docker-entrypoint.sh`),
+   read it. Look for:
+   - Pre-app commands (psql checks, migration runs, seed steps)
+   - Env-var validation (`: ${REQUIRED_VAR:?}` style fails the script)
+   - Multiple cli tools used in sequence (psql + node + redis-cli)
+
+d) **Monorepo manifest** — at most one of:
+   - `nx.json` (Nx)
+   - `turbo.json` (Turborepo)
+   - `lerna.json` (Lerna)
+   - `pnpm-workspace.yaml` (pnpm workspaces)
+   - root `package.json` with `workspaces: [...]` (Yarn/npm workspaces)
+   Note: monorepo type, list of packages/apps, build targets per package.
+
+e) **ORM / DB config files** — search by name (depth ≤ 5):
+   - `prisma/schema.prisma` → look for `extensions = [...]` (Postgres
+     extensions the app needs), datasource provider, env-var names used.
+   - `ormconfig.{js,ts,json}`, `data-source.ts`, `data-source.js` →
+     TypeORM config; look for `ssl:` block and any env-var names.
+   - `drizzle.config.{ts,js}` → migrations folder, dialect.
+   - `alembic.ini`, `migrations/env.py` → Alembic (Python) config.
+   - `database.yml`, `config/database.yml` → Rails ActiveRecord config.
+   - Note ANY env-var names referenced in these files that look
+     SSL-related: `*_SSL`, `*_SSL_*`, `*REJECT_UNAUTHORIZED*`,
+     `DATABASE_URL`, `DB_*`. The exact knob name varies by app —
+     deferring to whatever the app source uses.
+
+f) **Health endpoint** — grep app source (depth ≤ 5), case-insensitive,
+   for these patterns. Stop after first 5 matches per pattern; you only
+   need a sense of which paths exist.
+   - NestJS: `@Get\((['"])(/[a-z_/-]*health[a-z_/-]*)\1`
+   - Express: `\.(get|all)\((['"])(/[a-z_/-]*health[a-z_/-]*)\2`
+   - Django: `path\((['"])([^'"]*health[^'"]*)\1` in `urls.py`
+   - Rails: `get (['"])([^'"]*health[^'"]*)\1` in `routes.rb`
+   - FastAPI/Flask: `@(app|router)\.(get|route)\((['"])(/[a-z_/-]*health[a-z_/-]*)`
+   - Spring Boot: presence of `spring-boot-starter-actuator` →
+     defaults to `/actuator/health`.
+   - Generic last-resort: `grep -rn 'healthz\|/health\b' --include='*.{ts,js,py,go,rb,java,kt}'`
+   Compare ALL discovered paths to `inputs_yaml.health_check_path`. If
+   the path the app actually serves differs, queue a Phase 1.7 fix.
+
+g) **README hints** — grep README files (`README*`, `docs/DEPLOY*`,
+   `docs/SELF_HOST*`, `INSTALL*`) for sections matching
+   `/deploy|self-host|production|installation|configuration/i`. Read
+   ~50-100 lines around each match. Surface non-obvious requirements
+   (special env vars, manual setup steps, port assumptions).
+
+h) **Stack-specific knobs** — grep app source for these env-var idioms:
+   - SSL toggles: `PG_SSL_*`, `DATABASE_SSL_*`, `DB_SSL_*`, `MYSQL_SSL_*`,
+     `*_REJECT_UNAUTHORIZED*`, `DB_*_CA_CERT*`
+   - Self-URL: `*_BASE_URL`, `*_PUBLIC_URL`, `SERVER_URL`, `APP_URL`,
+     `FRONT_BASE_URL`, `NEXT_PUBLIC_*`, `VITE_*`, `REACT_APP_*` —
+     these usually need to be set to the ALB DNS at deploy time.
+   - Storage toggle: `STORAGE_TYPE`, `STORAGE_PROVIDER`, `STORAGE_*`
+   - Email: `MAIL_*`, `SMTP_*`, `EMAIL_*`
+   - Feature gates: `IS_*_ENABLED`, `*_DISABLED`, `ENABLE_*`,
+     `DISABLE_*` — these gate optional services (billing, analytics,
+     telemetry) that you should turn OFF if not configured.
+
+**Write a brief intel summary into your reasoning** before moving on. It
+helps you (and future-you, on a re-run) keep the picture coherent. The
+summary should fit in 10-15 lines and answer:
+- What stack? (language, framework, ORM)
+- What monorepo? (nx/turbo/lerna/none)
+- How many services to deploy? (1 backend, +1 frontend if applicable)
+- What migrations command will I need?
+- What env vars does the app demand? (count + 3-5 most critical)
+- What health-check path does the app actually expose?
+- What stack-specific SSL/storage/feature flags do I need to set?
+
+### 1.6 Authenticate Docker to ECR
+
+```
+aws ecr get-login-password --region {{region}} | \
+  docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+```
+
+One login per account/region covers all repos in that account.
+
+### 1.7 Anticipatory pre-fixes (apply BEFORE first build)
+
+For each mismatch detected in 1.4-1.5, apply the corresponding fix now —
+**before** the first `docker build`. These do NOT count toward the Phase 4
+attempt budget. Log each as a "Pre-fix" entry in `{{attempts_path}}`
+(no attempt number, just `## Pre-fix N — <iso8601>`).
+
+Apply these without prompting (they're all safe via Phase 4 whitelist
+mechanisms — task-def, target-group, Secrets Manager):
+
+1. **Health-check path mismatch** (Phase 1.5.f vs `inputs_yaml`):
+   `aws elbv2 modify-target-group --target-group-arn <arn> --health-check-path <real-path>`.
+   If multiple plausible paths found, prefer the most specific
+   (e.g. `/healthz` over `/`).
+
+2. **Container port mismatch** (Phase 1.4.b vs task-def):
+   When you register the new task-def in Phase 2.2, set
+   `containerDefinitions[].portMappings[].containerPort` to the EXPOSE
+   value. Also `aws elbv2 modify-target-group --target-group-arn <arn>
+   --port <real-port> --health-check-port <real-port>` if the target
+   group disagrees.
+
+3. **Env vars from `.env.example` not in task-def** — for each missing
+   key, add to `containerDefinitions[].environment[]`:
+   - If key matches `*SECRET*`/`*PASSWORD*`/`*TOKEN*`/`*KEY*` (case
+     insensitive): generate `openssl rand -hex 32`, store via
+     `aws secretsmanager create-secret` (skip if already exists),
+     reference via `secrets[]` not `environment[]`.
+   - If key looks like a self-URL (matches the patterns in 1.5.h
+     "Self-URL"): set to `http://<alb_dns>/` (or `http://<alb_dns>/api/v1`
+     for backend-internal API URLs). Add `https://` only if `domain_name`
+     in inputs.yaml is non-empty.
+   - If key is a feature gate (matches 1.5.h patterns) and the underlying
+     service isn't provisioned (e.g. `IS_BILLING_ENABLED` and we have no
+     Stripe): set to `false` / `0`.
+   - If key looks like a storage toggle and we have no S3 in stack: set
+     `STORAGE_TYPE=local` (or equivalent).
+   - For SSL knobs (1.5.h "SSL toggles") found in app source: set to the
+     value that disables strict cert verification (`true` for
+     `*_ALLOW_SELF_SIGNED*`, `false` for `*_REJECT_UNAUTHORIZED*`).
+   - For everything else: empty placeholder + note in pre-fix log
+     "**operator must populate**: <KEY>".
+
+4. **Multi-stage Dockerfile target** — note the `--target <stage>` you'll
+   use for backend and (if applicable) frontend. No fix here, just
+   recorded for Phase 2.
+
+5. **Stack-specific defensive env additions** even if not in
+   `.env.example`:
+   - For backend always set `NODE_TLS_REJECT_UNAUTHORIZED=0` (dev TLS
+     escape hatch — covered by `iac_dir`/inputs.yaml `domain_name`
+     emptiness which means no real cert).
+   - For frontend, if you detect `NEXT_PUBLIC_API_URL` /
+     `VITE_API_URL` / `REACT_APP_API_URL` in env contract (1.5.a) but
+     not yet in task-def, set it to `/api/v1` (relative — same-origin via
+     ALB path-routing).
+
+6. **Postgres extensions** detected in 1.5.e (`prisma/schema.prisma`
+   `extensions = [...]`, or grep for `CREATE EXTENSION` in migrations):
+   queue these for Phase 4.2 if migrations fail. Don't preemptively run
+   `CREATE EXTENSION` unless you have proof they're needed — extensions
+   require superuser or specific RDS parameter group config.
+
+After all pre-fixes, write a "Pre-fix summary" entry to attempts.md
+listing what was changed and why. Then proceed to Phase 2.
+
+## Phase 2 — First-pass deploy
+
+For each service (backend first, then frontend if `include_frontend=true`):
+
+2.1. `docker buildx build --platform linux/amd64 [-f <Dockerfile>] [--target <stage>] -t <ecr_url>:<sha> --push <build_context>`
+
+2.2. Pull the *current* task-def, copy it, swap `image` → `<ecr_url>:<sha>`,
+     apply any port changes from Phase 1.7, register as new revision.
+
+2.3. `aws ecs update-service --cluster <c> --service <s> --task-definition <new_arn> --force-new-deployment`
+
+2.4. `aws ecs wait services-stable --cluster <c> --services <s>` (default
+     timeout is fine).
+
+## Phase 3 — Smoke test
+
+3.1. Backend health (only if `health_check_path` is non-empty after any
+     Phase 1.7 update):
+     `curl -fsS -o /dev/null -w "%{http_code}\n" http://<alb_dns><health_check_path>`
+     When `include_frontend=true` the ALB path-routes `/api/*` to backend.
+     Require 2xx.
+
+3.2. If `include_frontend=true`, frontend root:
+     `curl -fsS -o /dev/null -w "%{http_code}\n" http://<alb_dns>/`
+     Require 2xx.
+
+If both pass → **Phase 5**.
+
+## Phase 4 — Self-healing loop
+
+### Budget
+
+- **Max 3 attempts per root-cause CATEGORY** (categories = whitelist rows
+  in 4.2; count by row, not by individual symptom).
+- **Max 8 attempts total** across all categories.
+- After 3 in same category, that category is exhausted — STOP that thread
+  and either try a different category if a new symptom appears, or go to
+  Phase 6 if all live categories are exhausted.
+
+### Bookkeeping
+
+Maintain a live counter at the top of `{{attempts_path}}` (overwrite each
+time):
+
+```
+## Attempt counter (live)
+- Categories used:
+  - SSL config: 2/3
+  - Migrations: 1/3
+  - Health-check: 0/3 (pre-fixed in Phase 1.7)
+- Total: 3/8
+```
+
+Each attempt entry MUST include `**Category:** <name>` so re-runs can
+audit and the failure report can summarize.
+
+### Discipline
+
+- **One change per attempt.** No batch fixes — hard to attribute success.
+- **No fix outside the whitelist.** If symptom doesn't match any row →
+  Phase 6 with category `Unrecognized failure`.
+- **No IaC changes.** Anything requiring Terragrunt edits → Phase 6 with
+  category `Requires infrastructure change`.
+
+### 4.1 Diagnose (run all five, paste relevant output into the entry)
+
+a. `aws ecs describe-services --cluster <c> --services <s> --query 'services[0].events[0:8]'`
+b. `aws ecs list-tasks --cluster <c> --service-name <s> --desired-status STOPPED --max-results 5`
+   then for each: `aws ecs describe-tasks --cluster <c> --tasks <arn> --query 'tasks[0].{stop_code:stopCode,reason:stoppedReason,exit:containers[0].exitCode,exit_reason:containers[0].reason}'`
+c. `aws logs tail <log_group_name> --since 5m --follow=false`
+d. `aws elbv2 describe-target-health --target-group-arn <arn>`
+e. If suspected connectivity: `aws ecs execute-command` → `curl localhost:<port>/<path>` to bisect container vs ALB vs network.
+
+### 4.2 Whitelist — match symptom, apply fix
+
+| # | Symptom | Allowed fix | Category |
+|---|---|---|---|
+| 1 | `Error: <VAR> is required` / `Missing env <VAR>` / `<VAR> is undefined` | Same as Phase 1.7.3 — secret-pattern keys via Secrets Manager, others as plain env or empty + warning. | `Missing env var` |
+| 2 | `OOMKilled` / `exit code 137` | Re-register task-def with memory doubled. Cap at 8192 (4096→8192 at most one bump; refuse further — that's into "Scale beyond skeleton" territory). | `OOM` |
+| 3 | ALB target unhealthy: HTTP 404 on health-check path | Try health-check path candidates from Phase 1.5.f findings, in order of specificity. Then `/healthz`, `/`, `/api/health`, `/api/v1/health`, `/actuator/health`, `/-/healthy`. | `Health-check path` |
+| 4 | ALB returns **503** for all paths despite tasks RUNNING | Means no healthy targets. Check `describe-target-health` reason — if 404, treat as row 3 above. If 502/connection-refused, treat as row 6 below. | `Health-check path` (or 6) |
+| 5 | `relation "X" does not exist` / `pg_migration` / `no such table` / `Migration table not found` / `relation does not exist` | `aws ecs execute-command` then run migrations using the ORM detected in Phase 1.5.b: `npx typeorm migration:run`, `npx prisma migrate deploy`, `npx drizzle-kit migrate`, `npx knex migrate:latest`, `npx sequelize-cli db:migrate`, `python manage.py migrate`, `bundle exec rake db:migrate`, `alembic upgrade head`, `flyway migrate`, `goose up`. Try in order until one returns 0. | `Migrations` |
+| 6 | `connection refused to <host>:<port>` where host matches a stack output (db_instance_address, primary_endpoint_address) | Verify env-var → output mapping. Fix in task-def. If host matches `127.0.0.1`/`localhost`, look for a config file in app source overriding `DATABASE_URL` — change the right env-var name found in Phase 1.5.e. | `Connection routing` |
+| 7 | Container starts but ALB returns 502/503 for >2 min, container responds locally on `<port>` | Port mismatch. Compare task-def `containerDefinitions[].portMappings[].containerPort`, target-group port, and the app's actual listening port. Align all three. | `Port mismatch` |
+| 8 | `image manifest not found` / `pull access denied` after build | Re-run `docker push`. If still failing, verify ECR repo URI matches outputs and re-tag. | `Image push` |
+| 9 | TS build error like `Could not find a declaration file for module 'X'` | Create `Dockerfile.deploy` next to upstream Dockerfile that adds `RUN echo "declare module 'X' { const v: any; export default v; }" >> <path>/ambient-shims.d.ts` BEFORE the build step. | `Build-time TS bug` |
+| 10 | `EACCES` / permission denied on volume mount | Remove explicit `user` override from task-def — most images need root or default. | `Container user` |
+| 11 | `read-only file system` errors during startup | Set `readonly_root_filesystem=false` on task-def. | `Filesystem` |
+| 12 | `psql: invalid sslmode value: "no-verify"` (libpq doesn't know node-pg's flag) | Replace URL `sslmode=no-verify` with `sslmode=require` AND set env `NODE_TLS_REJECT_UNAUTHORIZED=0` AND any ORM-specific knob from Phase 1.5.h (e.g. `PG_SSL_ALLOW_SELF_SIGNED=true`, `DATABASE_SSL_REJECT_UNAUTHORIZED=false`). | `SSL config` |
+| 13 | `SELF_SIGNED_CERT_IN_CHAIN` after enabling SSL | Same as 12 — adds the ORM-specific knob if pure `NODE_TLS_REJECT_UNAUTHORIZED` isn't enough (some ORMs build per-DataSource SSL configs). | `SSL config` |
+| 14 | `extension "X" does not exist` (X = `uuid-ossp`, `pg_trgm`, `vector`, `btree_gist`, `citext`, …) | `aws ecs execute-command` then `psql <DATABASE_URL> -c 'CREATE EXTENSION IF NOT EXISTS "X"'`. If psql isn't in container, exec a debugger task with the postgres image. | `DB extensions` |
+| 15 | `Cannot find module '<workspace-package>'` / `Module not found: <internal-pkg>` | Workspace dependency hoisting issue. Create `Dockerfile.deploy` that copies the WHOLE monorepo and runs `yarn install` / `pnpm install --frozen-lockfile` / `npm ci --include-workspaces` at root before building. | `Workspace deps` |
+| 16 | `host not found in upstream` (nginx) / `getaddrinfo ENOTFOUND` to a service name (e.g. `redis`, `postgres`) | App config has a hardcoded service name from docker-compose. Patch via `Dockerfile.deploy` overriding the relevant config file (nginx.conf, app config) to use either the env-var-driven host or `localhost`. | `Hardcoded host` |
+| 17 | Slow-start app: tasks cycling because health-check fires before app ready | `aws elbv2 modify-target-group` → set `--healthy-threshold-count 2 --health-check-interval-seconds 30 --health-check-grace-period-seconds 120`. | `Slow start` |
+| 18 | Frontend smoke 200 but blank page in browser | API base URL mismatch. Set `NEXT_PUBLIC_API_URL` / `VITE_API_URL` / `REACT_APP_API_URL` to `/api/v1` (relative same-origin) in frontend task-def and rebuild. | `Frontend API URL` |
+| 19 | `Cannot find DataSource` / app expects DB URL in different env-var name than we set | Phase 1.5.e should have caught this. Find the config file referencing the env var (typeorm config, prisma datasource, etc.) and set THAT env-var name in task-def. | `Env var name mismatch` |
+| 20 | Multiple consecutive task starts with no logs at all (immediate exit) | Container failing before any logging starts — usually missing `CMD`/`ENTRYPOINT` due to wrong stage, or bash failure in entrypoint. Re-check Phase 1.4 stage choice. If correct, add `--init` flag in task-def OR fix entrypoint script bash issue via `Dockerfile.deploy`. | `Silent boot failure` |
+
+### 4.3 Apply the fix
+
+Run the exact commands. **One change per attempt.** Log per the template
+in 4.5.
+
+### 4.4 Re-run Phase 3 (smoke)
+
+- Pass → Phase 5.
+- Fail → check budget (4.0); if room, loop to 4.1; if exhausted, Phase 6.
+
+### 4.5 Per-attempt entry — append to `{{attempts_path}}`
+
+```
+## Attempt <N> — <iso8601>
+**Service:** backend | frontend
+**Category:** <name from 4.2 column>  (counter: <X/3 in this category>)
+**Symptom:** <one-line summary; quote the key error line>
+**Diagnose output:** <≤10 lines of the most relevant log/event/describe output>
+**Classification:** <which whitelist row matched>
+**Fix applied:** <exact aws/docker commands run>
+**Result:** healthy after <Ns> | still failing → see attempt <N+1> | giving up → Phase 6
+```
+
+After writing, update the live counter block at the top of attempts.md.
+
+## Phase 5 — Success
+
+**ORDER OF OPERATIONS IS MANDATORY.** The bash wrapper greps stdout for
+the success marker. If you stop without emitting it (e.g. you got stuck
+in a TaskStop/Monitor cleanup), the entire recipe is recorded as a
+failure even though the deploy succeeded. Real incident: a successful
+deploy was logged as failed because the model called TaskStop on a
+lingering Monitor BEFORE printing `APP DEPLOYED`.
+
+Therefore: **first tell the operator what happened, then emit the
+success marker, and only AFTER that touch any cleanup tools.**
+
+5.1. Print the human-readable `## Access summary` block to stdout (only
+     lines with known values):
+
+- **Application URL**: `http(s)://<alb_dns>/`
+- **API health**:      `http(s)://<alb_dns><health_check_path>`
+- **Backend image**:   `<backend_uri>`
+- **Frontend image**:  `<frontend_uri>`
+- **Backend logs**:    `aws logs tail <backend_log_group> --since 5m`
+- **Frontend logs**:   `aws logs tail <frontend_log_group> --since 5m`
+- **Pre-fixes applied**: M (auto-fixes from Phase 1.7)
+- **Self-heal attempts**: N (full log: {{attempts_path}})
+
+5.2. Append one record to `{{history_path}}`:
+
+```json
+{"ts":"<iso8601>","git_sha":"<sha>","backend_image":"<ecr_url>:<sha>",
+ "frontend_image":"<ecr_url_fe>:<sha-or-null>","env":"{{env}}",
+ "region":"{{region}}","attempts":<N>,"prefixes":<M>,"result":"success"}
+```
+
+5.3. **Print the success marker on its own line, IMMEDIATELY after 5.2,
+     BEFORE any cleanup tool call:**
+- Single-service: `APP DEPLOYED image=<ecr_url>:<sha>`
+- Multi-service:  `APP DEPLOYED backend=<uri> frontend=<uri>`
+
+5.4. Cleanup is **optional** — the goose process exits naturally after
+     you stop, and any leftover Monitor / background jobs die with it.
+     If you absolutely must stop a Monitor or close a sub-process, do
+     so AFTER 5.3 has been printed, never before. A stuck cleanup tool
+     after the marker is harmless; a stuck cleanup tool before the
+     marker invalidates the whole recipe.
+
+## Phase 6 — Fail
+
+6.1. Write `{{failure_report_path}}`:
+
+```markdown
+# Deploy failure report — {{repo_name}} @ <iso8601>
+
+## Status
+STOPPED after <N> self-heal attempts (<M> pre-fixes).
+
+## What was tried
+**Pre-fixes (Phase 1.7):** <copy from attempts.md pre-fix entries>
+**Self-heal attempts:** <copy each attempt's Category + Fix applied + Result>
+
+## Categories exhausted
+- <category>: 3/3 (rows tried, all failed)
+- ...
+
+## Root cause
+<plain-English paragraph; if unknown say so>
+
+## Categorization (pick one)
+- Missing dependency service (skeleton needs e.g. Typesense, Elasticsearch, Kafka)
+- Missing external SaaS account (real Stripe/Sendgrid/OpenAI key required)
+- Architectural incompatibility (k8s feature, GPU, Windows containers)
+- Scale beyond skeleton (needs RDS r6g.xlarge, multi-AZ ECS, etc.)
+- Upstream code bug (app crashes regardless of infra)
+- Requires infrastructure change (fix lives in IaC, not deploy-app scope)
+- Ambiguous monorepo layout (operator must specify Dockerfile paths)
+- Missing infrastructure outputs (deploy-infra didn't produce expected keys)
+- Unrecognized failure (no whitelist match — needs framework extension)
+
+## Recommended actions
+<concrete next steps; "create OpenSearch domain via console, then put OPENSEARCH_URL into Secrets Manager, then re-run deploy-app">
+
+## Logs and resources
+- CloudWatch log groups: <list>
+- Last failed task ARNs: <list>
+- ALB DNS: <url>
+- ECR images pushed during this run: <list>
+- Secrets created during attempts/pre-fixes: <list — operator should review/rotate placeholders>
+- Approximate AWS cost so far: ~$<estimate>
+
+## Operator next steps
+- Stop billing immediately:  `./devops-ai.sh destroy {{repo_name}}`
+- Retry after fix:           `./devops-ai.sh deploy-app {{repo_name}}`
+- Extend the framework:      see `docs/03_runbook.md`
+```
+
+6.2. Append failed JSON to `{{history_path}}`:
+
+```json
+{"ts":"<iso8601>","git_sha":"<sha>","env":"{{env}}","region":"{{region}}",
+ "attempts":<N>,"prefixes":<M>,"result":"failed","category":"<from above>",
+ "exhausted_categories":["<cat1>","<cat2>"],"last_error":"<short>"}
+```
+
+6.3. Print one terminal line and stop:
+`APP DEPLOY FAILED after <N> attempts — see {{failure_report_path}}`
+
+## Constraints
+
+### ALLOWED
+- `docker build`, `docker push`, `docker pull`
+- `aws ecr *` (read + push)
+- `aws ecs register-task-definition`, `update-service`, `wait`,
+  `describe-*`, `list-*`, `execute-command`
+- `aws elbv2 modify-target-group`, `describe-target-health`,
+  `describe-target-groups`
+- `aws secretsmanager create-secret`, `put-secret-value`,
+  `describe-secret`, `get-secret-value`, `list-secrets`
+- `aws logs tail`, `get-log-events`, `describe-log-streams`,
+  `describe-log-groups`
+- `aws cloudwatch get-metric-statistics`
+- Reading any file under `{{source_path}}` (Phase 1.5)
+- Writing to `{{attempts_path}}`, `{{failure_report_path}}`,
+  `{{history_path}}`
+- Creating a *new* `Dockerfile.deploy` next to an upstream Dockerfile.
+  Never modify upstream files in place.
+
+### FORBIDDEN
+- Modifying anything under `{{iac_dir}}/` (IaC is regenerated by
+  `generate-iac`, not edited at deploy time).
+- `aws iam *` create/update/delete (security boundary).
+- `aws ec2 *`, `aws rds modify-*`, `aws elasticache modify-*`,
+  `aws elbv2 create-*`/`delete-*` (resource shape).
+- Any `aws *-delete-*` command.
+- Editing application source code beyond a freshly-created `Dockerfile.deploy`.
+- Running more than 3 attempts in the same category.
+- Running more than 8 attempts total.
+- Applying any fix not in the Phase 4.2 whitelist.
+- Pushing the `latest` tag.
+- Output language other than English.
+
+### LOOP DISCIPLINE
+- One fix per attempt.
+- Pre-fixes (Phase 1.7) come BEFORE attempts and don't count toward 4.0
+  budget. They do count in the access summary.
+- After 3 attempts in same category with no progress → category
+  exhausted; either pivot to a different category if a new symptom
+  appears, or Phase 6.
+- Always build for `linux/amd64`.

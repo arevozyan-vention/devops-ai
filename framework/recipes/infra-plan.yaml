@@ -1,0 +1,174 @@
+# Goose recipe: terragrunt plan + emit a plan summary as an architecture
+# diagram (not a wall of text). The summary's job is to let the operator
+# see in one glance: what resources, where they live, how they're wired,
+# why each one exists. Terragrunt's verbose stdout is captured under /tmp/
+# for debugging but never copy-pasted into the summary.
+version: "1.0.0"
+title: "Plan infrastructure (architecture-schema summary)"
+description: "Run terragrunt plan, write deploy/plan_summary.md as an architecture diagram + resource map."
+temperature: 0.2
+max_turns: 80
+parameters:
+  - { key: repo_name,         input_type: string, requirement: required, description: "Project name." }
+  - { key: iac_dir,           input_type: string, requirement: required, description: "Path to the rendered Terragrunt project." }
+  - { key: env,               input_type: string, requirement: required, description: "Environment (dev for now)." }
+  - { key: region,            input_type: string, requirement: required, description: "Cloud region (us-east-1 / eastus)." }
+  - { key: cloud,             input_type: string, requirement: optional, default: "aws", description: "aws | azure (drives identity check + diagram primitives)." }
+  - { key: plan_summary_path, input_type: string, requirement: required, description: "Where to write the schema-style summary." }
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You produce ONE artefact: a plan summary at `{{ plan_summary_path }}`
+  shaped as an **architecture schema** — diagram + resource map — derived
+  strictly from the stdout of `terragrunt run --all plan`. No prose
+  walkthrough, no advice paragraph. The operator approves the schema, then
+  apply runs.
+
+  ## Inputs
+
+  - Cloud:    **{{ cloud }}**
+  - IaC tree: {{ iac_dir }}
+  - Env:      {{ env }}      Region: {{ region }}
+  - Output:   {{ plan_summary_path }}
+
+  ## Terragrunt 1.x cheatsheet (don't invent removed flags)
+
+  - `terragrunt run --all plan --non-interactive`   ← right form
+  - `--terragrunt-non-interactive` no longer exists (drop the prefix)
+  - `--terragrunt-parallelism` no longer exists (use `TG_PARALLELISM` env)
+  - Terraform-specific flags after `--` separator
+  - On `flag provided but not defined`: STOP, re-read this. Do NOT retry.
+
+  TIMEOUTS: 5–15 min cold-cache plan. Set `timeout_secs=6000` on the
+  shell call. Do NOT pipe terragrunt stdout into Monitor or `tail -F` —
+  it has hung 30+ minute past completion before. Run synchronously.
+
+  ## Task
+
+  1. **Identity check** — branch by cloud:
+     - aws   → `aws sts get-caller-identity` → keep `Account`, `Arn`
+     - azure → `az account show -o json` → keep `id` (subscription), `tenantId`
+
+  2. **Greenfield detection** — branch by cloud:
+     - aws   → list S3 state bucket
+     - azure → list Azure Blob state container
+     If you can't determine, assume GREENFIELD.
+
+  3. **Plan**
+     - cloud=aws on greenfield: exclude `ecs-service` (+ frontend/keycloak
+       if their `include_*=true`) — module data sources need an existing VPC.
+     - cloud=azure: no greenfield exclusions needed.
+     Tee output: `terragrunt run --all plan --non-interactive | tee /tmp/tg_plan.log`
+     Wait for it to return. Read exit code.
+
+  4. **Parse, do not summarize.** Extract from terragrunt stdout:
+     - Per-unit `Plan: N to add, M to change, K to destroy.` lines
+     - Resource names from `+ resource "TYPE" "NAME"` blocks (per unit)
+
+  5. **Write the schema-style summary.** Use the structure below verbatim.
+
+  6. Print success marker exactly: `PLAN READY plan_summary={{ plan_summary_path }}`
+
+  ## Required output structure ({{ plan_summary_path }}, Markdown)
+
+  ```
+  # Plan summary — {{ repo_name }} / {{ env }} / {{ region }}  (cloud={{ cloud }})
+
+  ## Identity
+  - <AWS account / Azure subscription id>
+  - <ARN / tenant id>
+  - Generated: <iso8601-utc>
+
+  ## Architecture (ASCII diagram — text only, no images)
+
+  Render the actual topology of the units in this plan. Use the cloud's
+  primitives. Show: ingress → compute → data + auxiliary services.
+  Group resources by unit name in brackets. Examples:
+
+  AWS shape:
+  ```
+                       Internet
+                          │ http(s) :80/:443
+              ┌───────────▼───────────┐
+              │ ALB  [alb]            │
+              └───────────┬───────────┘
+                          │
+              ┌───────────▼───────────┐
+              │ ECS service           │  task: cpu/mem
+              │ [ecs-service]         │  pulls from ECR
+              └─────┬─────┬─────┬─────┘
+              env       │     │
+        ┌───────────┐   │     │
+        │ Secrets   │◀──┘     │
+        │ [secrets] │         │
+        └───────────┘         │
+              ┌───────────────▼─────┐
+              │ RDS Postgres        │
+              │ [rds]  port 5432    │
+              └─────────────────────┘
+       VPC [vpc]: 2× public + 2× private subnets, single NAT
+  ```
+
+  Azure shape:
+  ```
+                       Internet
+                          │ https :443
+              ┌───────────▼─────────────┐
+              │ Container App           │
+              │ [container-app]         │  pulls from ACR
+              │ ingress.target_port:N   │  identity: managed
+              └───┬───┬───┬─────────────┘
+                  │   │   │
+        Key Vault │   │   │   ACR
+        [secrets] │   │   │   [acr]
+                  │   │   │
+              ┌───▼───┴───▼───────┐
+              │ Postgres Flexible │
+              │ [postgres] :5432  │
+              └───────────────────┘
+       VNet [vnet]: aca-subnet (delegated /23) + postgres-subnet (delegated)
+       RG [resource-group]
+  ```
+
+  Adapt the diagram to the actual units present in this plan
+  (drop or add boxes for redis / queue / frontend / keycloak / alb-https
+  / custom-domain-https as the plan shows them).
+
+  ## Resource map
+
+  | Unit | Type | Name | Where | Why |
+  |------|------|------|-------|-----|
+  | <unit> | <terraform resource type> | <expected name> | <subnet / RG / SKU> | <one-line role> |
+
+  Sort by unit name. ONLY rows that appear as `+ resource ...` in the
+  plan output. No fabricated entries.
+
+  ## Per-unit counts
+
+  | Unit | + add | ~ change | - destroy |
+  |------|-------|----------|-----------|
+
+  ## Totals
+  - To add: N
+  - To change: M
+  - To destroy: K
+
+  ## Deferred to apply
+  Only if `cloud=aws` greenfield excluded units. List them with the
+  one-line reason (`data "aws_subnet"` lookup before VPC exists). Empty
+  list otherwise.
+  ```
+
+  ## Constraints
+
+  - **No prose walkthrough.** No "this section will discuss…" / "we will
+    create…" — table rows + diagram only.
+  - **Schema rows must derive from terragrunt stdout.** Do not add
+    "expected" resources you don't see in `+ resource ...` lines. If a
+    deferred unit will obviously add resources (ecs-service on greenfield),
+    list under "Deferred to apply" with a count estimate, not in
+    Resource map.
+  - **English only.**
+  - **Output discipline:** when done, print `PLAN READY plan_summary={{ plan_summary_path }}`
+    on its own line BEFORE any cleanup. Bash greps stdout for it.

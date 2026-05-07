@@ -1,0 +1,92 @@
+# Goose recipe: drift / posture audit for Azure deployments. Mirrors
+# recipes/audit.yaml but queries Azure via `az` instead of AWS APIs.
+version: "1.0.0"
+title: "Audit deployed Azure resources vs IaC"
+description: "Compare iac/ vs deployed Azure state, flag drift, orphans, security drift, missing tags."
+temperature: 0.2
+max_turns: 60
+parameters:
+  - { key: repo_name,    input_type: string, requirement: required, description: "Project name." }
+  - { key: iac_dir,      input_type: string, requirement: required, description: "Path to the rendered Terragrunt project (desired state)." }
+  - { key: outputs_path, input_type: string, requirement: required, description: "Path to deploy/outputs.json (last-known endpoints)." }
+  - { key: output_path,  input_type: string, requirement: required, description: "Where to write the audit Markdown report." }
+  - { key: state_yaml,   input_type: string, requirement: required, description: "Path to the project's state.yaml." }
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are a senior SRE auditing the gap between the IaC-declared state of
+  an Azure deployment and what is actually running in the subscription.
+
+  ## Inputs
+  - IaC tree (desired state): {{ iac_dir }}
+  - Last-known terragrunt outputs: {{ outputs_path }}
+  - Project state.yaml: {{ state_yaml }}
+  - Report output (write to here): {{ output_path }}
+
+  ## Goal
+  Use `az` (via the developer MCP) and `terraform` MCP to query reality
+  and write a one-shot drift report.
+
+  ## What to check
+
+  - **Configuration drift**: ACA replicas / probes / env vars / scale
+    rules vs IaC, Postgres SKU / storage / backup-retention, ACR SKU
+    and admin-enabled flag, Key Vault access policies vs role assignments,
+    VNet subnet delegations.
+  - **Orphan resources**: anything tagged `project=<repo> environment=<env>`
+    in the subscription that the IaC tree does not declare. Use:
+    `az resource list --tag project=<repo> --query "[?tags.environment=='<env>'].{name:name, type:type, rg:resourceGroup}"`
+  - **Tag posture**: any resource in the project resource group missing
+    the standard tag schema (`project`, `environment`, `managedby`,
+    `skeleton`).
+  - **Security drift**: NSG inbound rules widened, Postgres firewall
+    extra entries, Key Vault public-network-access flipped on, ACR
+    admin-enabled flipped on, role assignments outside what the
+    identity module created.
+  - **Cost smell**: idle resources — Container App with traffic_weight=0
+    on every revision, ACR with no pull events in 30 days, Postgres
+    near-zero CPU sized larger than B1ms, Log Analytics with retention
+    misconfigured for volume.
+  - **Compliance posture**: Postgres point-in-time backup retention,
+    geo_redundant_backup if prod was promised, NSG flow logs on,
+    Defender for Cloud findings.
+
+  ## Required output structure (Markdown, English)
+
+  ```
+  # Audit — {{ repo_name }}  (Azure)
+
+  ## Verdict
+  [ ] In sync / no action needed
+  [ ] Drift found — review below
+  [ ] Critical issues — needs immediate action
+
+  ## Drift table
+  | Resource | Type | Attribute | IaC says | Azure says | Severity |
+
+  ## Orphan resources
+  | Resource | Type | First seen (createdTime) | Why probably here | Suggested action |
+
+  ## Tag posture
+  | Resource | Missing tags | Action |
+
+  ## Security findings
+  bullets
+
+  ## Cost smell
+  bullets, with `az consumption usage list` references when possible
+
+  ## Recommended actions
+  ordered list, each item with the exact `az` or `terragrunt` command
+  to run
+  ```
+
+  ## Constraints
+
+  - English only.
+  - Do not modify the deployment — read-only.
+  - Cite `az resource show` / `terragrunt plan` output for every drift
+    claim. No hand-waved findings.
+  - **Output discipline:** print `WROTE {{ output_path }}` on its own
+    line, BEFORE any cleanup tool. Bash greps stdout for the marker.

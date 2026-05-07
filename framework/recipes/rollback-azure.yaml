@@ -1,0 +1,52 @@
+# Goose recipe: revert an Azure Container App to its previous successful image.
+# Mirror of recipes/rollback.yaml. No rebuild — pure runtime swap.
+version: "1.0.0"
+title: "Rollback application (Azure)"
+description: "Roll the Container App back to the previous successful image. No rebuild, no IaC change."
+temperature: 0.1
+max_turns: 40
+parameters:
+  - { key: repo_name,      input_type: string, requirement: required, description: "Project name." }
+  - { key: region,         input_type: string, requirement: required, description: "Azure region (eastus, etc.)." }
+  - { key: env,            input_type: string, requirement: required, description: "Environment (dev for now)." }
+  - { key: outputs_path,   input_type: string, requirement: required, description: "Path to deploy/outputs.json with infra endpoints." }
+  - { key: history_path,   input_type: string, requirement: required, description: "Append-only deploy/history.jsonl to update with rollback record." }
+  - { key: previous_image, input_type: string, requirement: required, description: "ACR image URI from the last successful history.jsonl record." }
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  Revert the Container App to the previous successful image.
+
+  ## Inputs
+  - Project: {{ repo_name }}     Env: {{ env }}     Region: {{ region }}
+  - Outputs: {{ outputs_path }}     History: {{ history_path }}
+  - Target image: {{ previous_image }}
+
+  ## Steps
+
+  1. Verify Azure identity and ACR access.
+  2. Confirm the target image exists in ACR:
+     `az acr repository show --name <acr> --image <repo:tag>`
+     If not found → STOP and report; cannot roll back to a non-existent image.
+  3. Print a 2-line summary: `current revision: ... → target image: {{ previous_image }}`.
+  4. Update Container App: `az containerapp update -n <app> -g <rg> --image {{ previous_image }}`.
+  5. Wait for new revision Provisioned + Running + traffic 100%, max 10 min.
+  6. Smoke test: 2xx on `<fqdn><health_path>` → success.
+     If runtime fails to stabilize → STOP and report. Do NOT attempt a
+     forward redeploy automatically; the operator decides.
+  7. Append a row to `{{ history_path }}`:
+     `{"ts": ..., "image": "{{ previous_image }}", "result": "rollback_success", "cloud": "azure"}`
+
+  ## Constraints
+
+  - Do NOT rebuild any image.
+  - Do NOT modify IaC.
+  - English only.
+
+  ## Output discipline (mandatory)
+
+  When successful, print summary FIRST, marker SECOND, cleanup LAST. Marker:
+  `ROLLED BACK {{ env }} -> {{ previous_image }}`
+
+  Never call TaskStop / Monitor cleanup before printing the marker.

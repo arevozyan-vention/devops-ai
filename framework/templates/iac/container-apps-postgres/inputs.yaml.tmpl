@@ -1,0 +1,46 @@
+# inputs.yaml — variable contract for the container-apps-postgres skeleton.
+# Consumed by lib/render.sh to substitute placeholders during `generate-iac`.
+#
+# Keep values flat scalar strings. Numeric values must be quoted. No nested
+# maps or lists — the renderer requires scalars.
+
+project_name: "{{project_name}}"
+region: "{{region}}"            # Azure location: eastus, westus3, westeurope, northeurope
+subscription_id: "{{subscription_id}}"
+tenant_id: "{{tenant_id}}"
+
+# Container runtime — backend (the primary service)
+container_name: "{{container_name}}"
+container_port: "{{container_port}}"
+health_check_path: "{{health_check_path}}"
+
+# Container runtime — frontend (opt-in, see include_frontend below)
+frontend_container_name: "{{frontend_container_name}}"
+frontend_container_port: "{{frontend_container_port}}"
+frontend_health_check_path: "{{frontend_health_check_path}}"
+
+# Postgres Flexible Server
+db_engine_version: "{{db_engine_version}}"   # e.g. "16"
+db_name: "{{db_name}}"
+db_admin_username: "{{db_admin_username}}"
+
+# Optional public DNS — if empty, Container App serves on built-in
+# *.<region>.azurecontainerapps.io (HTTPS automatic).
+domain_name: "{{domain_name}}"
+
+# Observability
+log_retention_days: "{{log_retention_days}}"
+
+# Optional add-ons. "true" to deploy; defaults to "false". Each unit under
+# environments/<env>/{redis,queue,frontend,keycloak,custom-domain-https}/ checks
+# its flag and self-skips when off.
+include_keycloak:            "{{include_keycloak}}"
+include_custom_domain_https: "{{include_custom_domain_https}}"
+include_redis:               "{{include_redis}}"
+include_queue:               "{{include_queue}}"
+include_frontend:            "{{include_frontend}}"
+
+# Remote state — operator-controlled, lives outside this skeleton.
+# Format: <storage_account_name>/<container_name>
+state_storage_account: "{{state_storage_account}}"
+state_container:       "{{state_container}}"

@@ -1,0 +1,197 @@
+# Goose recipe: apply a previously-approved Terragrunt plan + capture outputs.
+# This recipe is invoked by framework/devops-ai.sh ONLY after the operator has
+# explicitly approved the plan summary via a real bash `read` prompt. Do not
+# re-prompt for approval here — the gate has already happened in shell.
+#
+# Source of truth for the prompt body: framework/prompts/infra-apply.md.tmpl
+version: "1.0.0"
+title: "Apply infrastructure"
+description: "Run terragrunt apply across all units in dependency order, then capture outputs as JSON."
+# Tuned for Opus 4.7. Zero temp — apply must be strictly procedural, no
+# creative deviation from the approved plan. max_turns very wide because
+# apply walks 11+ units and may need partial-failure recovery.
+temperature: 0.0
+max_turns: 100
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name (matches projects/<name>/)."
+  - key: iac_dir
+    input_type: string
+    requirement: required
+    description: "Path to the rendered Terragrunt project (projects/<repo>/iac/)."
+  - key: env
+    input_type: string
+    requirement: required
+    description: "Environment name: dev / stage / prod."
+  - key: region
+    input_type: string
+    requirement: required
+    description: "Cloud region. AWS form: us-east-1. Azure form: eastus."
+  - key: cloud
+    input_type: string
+    requirement: optional
+    default: "aws"
+    description: "Cloud the project targets: aws | azure (future: gcp). Drives the identity check."
+  - key: plan_summary_path
+    input_type: string
+    requirement: required
+    description: "Path to the plan summary file produced by infra-plan and approved by the operator."
+  - key: outputs_path
+    input_type: string
+    requirement: required
+    description: "Path to the JSON file where stack outputs will be written."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are applying cloud infrastructure that has already been planned and
+  human-approved via the framework's bash gate. You must NOT re-prompt for
+  approval — the operator already typed `apply` (or `apply prod`) outside this
+  recipe; you would not see the answer if you asked again. Just apply.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - Cloud: **{{ cloud }}**             # aws | azure
+  - IaC directory: {{ iac_dir }}
+  - Environment: {{ env }}             # dev (stage/prod out of scope)
+  - Region: {{ region }}               # AWS: us-east-1 / Azure: eastus
+  - Plan summary (already approved by operator): {{ plan_summary_path }}
+  - Outputs file (you must write this): {{ outputs_path }}
+
+  ## Terragrunt 1.x (stargazer) CLI cheatsheet
+
+  The framework runs Terragrunt 1.x. Many legacy `--terragrunt-*` flags have
+  been renamed or removed. Use only what is below.
+
+  KNOWN-GOOD INVOCATIONS:
+  - `terragrunt run --all apply --non-interactive`
+  - `terragrunt run --all output --non-interactive`
+  - `terragrunt force-unlock <LOCK_ID>`        (positional id only — no `--force`)
+  - `terragrunt --working-dir <unit-dir> apply` (single-unit form)
+
+  PASSING TERRAFORM FLAGS:
+  Terraform-specific flags (`-json`, `-lock=false`, `-refresh=false`) MUST come
+  after a literal `--` separator.
+    GOOD: `terragrunt run --all output --non-interactive -- -json > {{ outputs_path }}`
+
+  FLAGS THAT NO LONGER EXIST (do not invent them):
+  - `--terragrunt-include-external-dependencies`
+  - `--terragrunt-non-interactive`     (just `--non-interactive`)
+  - `--terragrunt-parallelism`         (use `TG_PARALLELISM` env var)
+  - `--force` on `force-unlock`
+
+  IF YOU SEE `flag provided but not defined` or `is not a valid flag for ...`,
+  STOP. Re-read this cheatsheet. Do NOT retry the same command verbatim.
+
+  TIMEOUTS: a full `--all apply` for ~10 modules on a cold cache can take
+  10-25 minutes (RDS alone can be 5-10 min), and local-model latency can
+  stretch wall time further. Set `timeout_secs=6000` on every shell call that
+  runs terragrunt. If Goose rejects this value as too large, fall back to
+  `timeout_secs=3600` and report the rejection in your next message — do not
+  silently drop to a smaller number.
+
+  ## DO NOT use Monitor / background tail for `terragrunt apply`
+
+  `terragrunt run --all apply` has a definite end (the process exits when
+  the last unit finishes or fails). Run it **synchronously** as a single
+  shell call with a generous `timeout_secs`. Do NOT pipe its log into a
+  `tail -F` under Monitor or under `run_in_background` — by the time your
+  tail starts, the apply may have already printed its completion lines,
+  and the tail will hang forever waiting for new lines that never come.
+  Several real runs have been wedged this way for 30+ minutes after the
+  apply itself finished.
+
+  Synchronous form (the only correct form for this recipe):
+  ```
+  cd <iac_dir>/environments/<env> && \
+    TG_PARALLELISM=1 terragrunt run --all apply --non-interactive
+  ```
+  Wait for it to return. Read the exit code. Done.
+
+  ## Task
+
+  1. Confirm cloud identity matches the plan summary header.
+
+     - cloud=aws → run `aws sts get-caller-identity` and compare the
+       returned `Account` and `Arn` to the `AWS account` / `AWS ARN`
+       lines at the top of `{{ plan_summary_path }}`.
+     - cloud=azure → run `az account show -o json` and compare the
+       returned `id` (subscription) and `tenantId` to the `Azure
+       subscription` / `Azure tenant` lines at the top of
+       `{{ plan_summary_path }}`.
+
+     If the identity does not match what the plan was approved against,
+     STOP — do not apply against a different account / subscription
+     than what the operator approved.
+
+  2. `cd {{ iac_dir }}/environments/{{ env }}` and run apply:
+     ```
+     terragrunt run --all apply --non-interactive
+     ```
+     Terragrunt walks the dependency graph automatically. Order varies
+     by cloud:
+     - cloud=aws (ecs-fargate-rds): vpc → secrets / iam / ecr / rds-sg
+       / ecs-cluster → alb / rds → ecs-service
+     - cloud=azure (container-apps-postgres): resource-group → vnet →
+       acr / secrets → identity / postgres / postgres-fw →
+       container-apps-env → container-app
+     Units that were "Deferred to apply" in the plan summary will
+     plan + apply here once their dependencies are real.
+
+  3. If apply fails part-way through, do NOT run `destroy`. Do NOT run `apply`
+     a second time blindly. Report the failed units and the verbatim error and
+     stop. The operator will decide whether to retry, fix manually, or roll
+     back the partial creation. Some retries are safe (transient AWS API
+     errors, eventual-consistency races); some require manual fixes — the
+     operator will decide.
+
+  4. Outputs collection is **not your job**. The framework wrapper
+     (`merge_terragrunt_outputs` in `lib/outputs.sh`) iterates units and
+     produces a correctly-merged `{{ outputs_path }}` AFTER you emit the
+     success marker. The legacy `terragrunt run --all output -- -json >
+     {{ outputs_path }}` invocation is broken (per-unit JSON gets
+     concatenated, invalid as a single document) and must NOT be used
+     here. Just don't touch the outputs file.
+
+  5. Print one line summarizing what was applied — count of units that
+     succeeded vs. failed (taken verbatim from terragrunt's "Run Summary"
+     stdout). Do NOT fabricate endpoints, ARNs, or IDs — those will be
+     filled in by the framework wrapper from real terragrunt output after
+     you exit.
+
+  6. Print exactly one final line and stop:
+     ```
+     INFRA DEPLOYED env={{ env }} region={{ region }}
+     ```
+
+  ## Constraints
+
+  - **No re-approval prompts.** The bash gate already happened. Do not write
+    "Type apply to proceed" or any equivalent. The operator is not connected
+    to your stdin.
+
+  - **Anti-hallucination.** Do not write to `{{ outputs_path }}`. The
+    framework wrapper handles it after you exit. Never fabricate ARNs,
+    endpoints, or IDs in your stdout either.
+
+  - **Identity safety.** If the cloud identity in step 1 does not match
+    what the plan was approved against, STOP without applying. AWS:
+    account ID + ARN. Azure: subscription ID + tenant ID.
+
+  - **Production extra care.** For `{{ env }} == prod`, if any unit shows
+    destroy or replacement of stateful resources (Postgres, Secrets/Key
+    Vault) at apply time, STOP and report — the bash gate already
+    approved the plan, but a destroy at apply time means real-world
+    drift between plan and apply, and the operator must be notified.
+
+  - **No destroy on failure.** If apply fails partway, never run `destroy` or
+    `state rm`. Report and stop.
+
+  - Output language: **English only**.
+
+  - When done successfully, print exactly: `INFRA DEPLOYED env={{ env }} region={{ region }}`
+    and stop. Any other final line means the framework will treat the run as
+    failed.

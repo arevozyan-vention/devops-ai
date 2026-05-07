@@ -1,0 +1,144 @@
+# Goose recipe: fill in application-specific values in a pre-rendered IaC skeleton.
+# Source of truth for the prompt body: framework/prompts/generate-iac.md.tmpl
+version: "1.0.0"
+title: "Finish IaC"
+description: "Resolve TODO markers in the rendered Terragrunt skeleton using overview + state."
+# Tuned for Opus 4.7. Lowest temp — HCL syntax is unforgiving, we want
+# deterministic output. max_turns wide because freedom to explore the IaC
+# tree is restored (we removed the pre-grep'd TODO list crutch from the
+# prompt; Opus finds and resolves markers itself with full context).
+temperature: 0.1
+max_turns: 80
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name (matches projects/<name>/)."
+  - key: source_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to the repository source tree."
+  - key: overview_path
+    input_type: string
+    requirement: required
+    description: "Path to docs/00_overview.md generated in the analyze step."
+  - key: skeleton_id
+    input_type: string
+    requirement: required
+    description: "Selected IaC skeleton id (e.g. ecs-fargate-rds)."
+  - key: iac_dir
+    input_type: string
+    requirement: required
+    description: "Already rendered Terragrunt project — writable."
+  - key: vars_yaml
+    input_type: string
+    requirement: required
+    description: "Variable file used to render the skeleton (read-only)."
+  - key: state_yaml
+    input_type: string
+    requirement: required
+    description: "Path to projects/<repo>/state.yaml."
+  - key: todo_list_path
+    input_type: string
+    requirement: required
+    description: "Path to a sidecar file the framework wrote with the EXACT, complete grep output of all TODO(devops-ai) markers in the rendered IaC. Read it first to know exactly which files and lines to edit."
+  - key: region
+    input_type: string
+    requirement: required
+    description: "AWS region (e.g. us-east-1)."
+  - key: env
+    input_type: string
+    requirement: required
+    description: "Environment name: dev / stage / prod."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are filling in application-specific values in a pre-built Terragrunt +
+  Terraform skeleton. The skeleton has already been copied and `{% raw %}{{ vars }}{% endraw %}` from
+  `{{ vars_yaml }}` have already been substituted by the framework. Your job is
+  to finish the parts that depend on application context which the variable
+  file cannot express by itself.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - Repository source (read-only): {{ source_path }}
+  - Repository overview (already generated): {{ overview_path }}
+  - Selected skeleton id: {{ skeleton_id }}
+  - Rendered IaC directory (writable): {{ iac_dir }}
+  - Project state file (read-only): {{ state_yaml }}
+  - Variable file used for skeleton render (read-only): {{ vars_yaml }}
+  - AWS region: {{ region }}
+  - Environment: {{ env }}
+  - **TODO worklist (advisory):** {{ todo_list_path }}
+    The framework grep'd `TODO(devops-ai)` markers as a starting hint.
+    You are NOT required to use this list — verify it's complete by
+    looking yourself, and resolve any markers you find.
+
+  ## Task
+
+  **Goal:** make `{{ iac_dir }}` ready for `terragrunt run-all plan`
+  against AWS account in {{ region }}/{{ env }}. Every `TODO(devops-ai)`
+  marker must be resolved with values correct for *this* application
+  (not generic placeholders), the IaC must be `terragrunt hcl format`-
+  clean, and any resolved value should be traceable back to the overview,
+  inputs.yaml, or live AWS state via the `terraform` MCP.
+
+  You have a 1M-token context, the `text_editor` for reads/writes, the
+  `terraform` MCP for live module/registry docs, and the `developer`
+  extension for shell. Use them however you see fit. Suggested approach
+  (not mandatory):
+
+  1. Read the overview ({{ overview_path }}) and inputs.yaml
+     ({{ vars_yaml }}) so you have the application facts.
+  2. Inspect the IaC tree at {{ iac_dir }} — note `environments/` per-env
+     configs vs `_envcommon/` shared, and which units depend on which
+     via `dependency` blocks.
+  3. Find every `TODO(devops-ai)` marker (the framework's
+     {{ todo_list_path }} is a starting list; verify it).
+  4. For each marker, read enough surrounding context — the whole file,
+     neighbouring units it depends on — to make a correct, internally
+     consistent resolution. Not just a syntactic str_replace.
+  5. Apply edits via `text_editor str_replace` (or `text_editor write`
+     when restructuring blocks).
+  6. Run `terragrunt hcl format --working-dir {{ iac_dir }}/environments` once.
+  7. Verify: `grep -rn 'TODO(devops-ai)' {{ iac_dir }}` should return
+     zero results in real HCL/TF files. False-positives in the worklist
+     tracking file are fine — explicitly note them.
+  8. One line per file you edited explaining WHY (not just what), then
+     the success marker on its own line.
+
+  ## What goes in each TODO type
+
+  - `_envcommon/secrets.hcl` `secret_keys = [...]` — list every secret name
+    from the overview's "Configuration" section that is marked sensitive
+    (passwords, tokens, client secrets). One key per line. Each becomes a
+    Secrets Manager entry named `{{ repo_name }}/{{ env }}/<KEY>` in
+    region `{{ region }}`.
+  - `_envcommon/ecs-service.hcl` `environment = [...]` — copy non-sensitive
+    env vars from the overview (DB_HOST, DB_PORT, REDIS_URL, API_PORT, etc.)
+    as `{ name = "...", value = "" }`. Use empty string for values the
+    operator must fill at deploy time.
+  - `_envcommon/ecs-service.hcl` `secrets = [...]` — for every entry in
+    `secret_keys` above, add `{ name = "<KEY>", valueFrom =
+    lookup(dependency.secrets.outputs.secret_arns_by_key, "<KEY>", "") }`.
+  - `_envcommon/alb.hcl` `certificate_arn = ""` — leave empty if
+    `domain_name` in inputs.yaml is empty (dev). Otherwise leave the
+    TODO and note in your summary that the operator must issue an ACM
+    cert and paste the ARN before `deploy-infra`.
+
+  ## Constraints
+
+  - **Stay inside `{{ iac_dir }}`** for writes. Reading the source repo
+    and overview is fine and encouraged.
+  - Use as many tool calls as you need to be correct. A wrong IaC value
+    caught at apply costs more than five extra reads now.
+  - Output language for any new comments / doc: **English only**.
+  - Never write real secret values into HCL. Always reference Secrets Manager.
+  - Never invent module sources. If a feature needs a module not present in the
+    skeleton, stop and report the gap rather than hand-writing resources.
+  - Do not run `apply`, `destroy`, or `plan -auto-approve`. Validation only.
+  - If anything in the overview contradicts the skeleton (e.g. overview says
+    MySQL but skeleton wires Postgres), stop and report the conflict.
+  - When done, print one line: `IAC READY {{ iac_dir }}` and stop.

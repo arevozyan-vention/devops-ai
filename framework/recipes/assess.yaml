@@ -1,0 +1,129 @@
+# Goose recipe: read a repository, write ONE concise overview that includes
+# both the project description and the deployment-fit / extensions block.
+# Replaces the older split between 00_overview.md (project) and
+# 02_infra_options.md (recommendation) — operators only need a single doc
+# to understand "what is this app, what should we deploy, how much, what's
+# the fit risk".
+version: "1.0.0"
+title: "Assess repository (project + deployment fit)"
+description: "Read source code, write ONE concise 00_overview.md covering tech, runtime, deployment fit + extensions."
+temperature: 0.2
+max_turns: 60
+parameters:
+  - { key: repo_name,     input_type: string, requirement: required, description: "Project name." }
+  - { key: source_path,   input_type: string, requirement: required, description: "Absolute path to the repository source tree (read-only)." }
+  - { key: templates_dir, input_type: string, requirement: required, description: "Absolute path to framework/templates/iac/." }
+  - { key: cloud,         input_type: string, requirement: optional, default: "aws", description: "Cloud the operator picked (drives skeleton + extension catalog)." }
+  - { key: skeleton_id,   input_type: string, requirement: optional, default: "ecs-fargate-rds", description: "Resolved skeleton directory under templates_dir." }
+  - { key: overview_path, input_type: string, requirement: required, description: "Absolute path to docs/00_overview.md to write (the single output)." }
+  - { key: state_yaml,    input_type: string, requirement: required, description: "Absolute path to the project's state.yaml (project history / context)." }
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You read a repository and write ONE concise overview that the operator
+  uses for the rest of the deployment flow. There is no separate
+  "infrastructure options" document — fit assessment + extension
+  recommendation live inside the same overview.
+
+  The choice the operator makes is *cloud*, not *architecture*. Each cloud
+  ships exactly one default skeleton (resolved upstream) — your job is
+  to describe the project, recommend which opt-in extensions to enable,
+  and flag fit concerns if the app is a stretch for the chosen runtime.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - Source code (read-only): {{ source_path }}
+  - Cloud:    **{{ cloud }}**
+  - Skeleton: `{{ templates_dir }}/{{ skeleton_id }}/`  (read its README only)
+  - Project state (read-only): {{ state_yaml }}
+  - Output (write here): {{ overview_path }}
+
+  ## Approach
+
+  1. Walk the repo broadly enough to KNOW (don't guess): language /
+     framework, persistence, runtime topology (web/api/worker/cron),
+     external integrations, secrets, existing deployment artefacts.
+     Skip lockfiles, vendored deps, test fixtures.
+  2. Read the skeleton's README at `{{ templates_dir }}/{{ skeleton_id }}/README.md`
+     — note which opt-in extensions exist. Do NOT read other skeleton
+     directories (they are for other clouds).
+  3. Decide which `--include` extensions this app needs (reasoning below).
+  4. Honest fit assessment for the chosen cloud's runtime model.
+  5. Estimate dev cost only (operator picks env=dev for now).
+  6. Write the overview at `{{ overview_path }}` in the structure below.
+  7. Stop after printing the success marker.
+
+  ## Extension picking heuristics (apply only when the source shows it)
+
+  | If overview shows | Recommend |
+  |---|---|
+  | BullMQ / distributed cache / session store / Redis client lib | `redis` |
+  | BullMQ / Sidekiq / Celery / SQS-SDK / async worker process | `queue` |
+  | Frontend folder with build pipeline (Vite / Next / CRA / SvelteKit / Vue / Angular) | `frontend` |
+  | Self-hosted Keycloak / OIDC server | `keycloak` (+ `alb-https` on AWS) |
+  | Custom domain with real TLS cert | `alb-https` (AWS) / `custom-domain-https` (Azure) |
+
+  ## Required output structure ({{ overview_path }}, Markdown, English only)
+
+  Keep it SHORT. No fluff. No "Open Questions" / "What we don't know" /
+  generic best-practices boilerplate. Cite file:line for non-obvious
+  claims; otherwise no citations needed.
+
+  ```
+  # {{ repo_name }}
+
+  **Cloud:** {{ cloud }}     **Skeleton:** {{ skeleton_id }}
+
+  ## Stack
+  - <language + version>
+  - <framework + version>
+  - <ORM / migrator>
+  - <queue / cache / search if used>
+
+  ## Runtime
+  - Single backend image | backend + frontend | backend + worker
+  - Ports: <list>
+  - Health check: <path>
+  - Migrations: <auto-on-boot | separate command>
+
+  ## Persistence
+  - Postgres <major version>  (or other engine)
+  - <volumes / S3 / Blob if needed>
+
+  ## Required env vars
+  | Name | Secret? | Notes (only if non-obvious) |
+
+  ## External integrations
+  Bullets — only what code actually calls (Stripe / SendGrid / OpenAI / …).
+  If none, write "none".
+
+  ## Deployment fit ({{ cloud }} / {{ skeleton_id }})
+  - **`--include` extensions to enable**:
+    `<csv>` (or "none")
+    Reason per extension on one line.
+  - **Estimated dev cost**: ~$X/month
+  - **Fit concerns** (only if any):
+    1-3 bullets where this skeleton is a stretch — e.g. WebSocket fan-out
+    at scale, GPU need, stateful sets needing AKS/EKS. If the app is a
+    clean fit, write "none".
+
+  ## Selection command
+  `./devops-ai.sh select {{ repo_name }} --cloud {{ cloud }} --region <r> --env dev [--include <csv>]`
+  ```
+
+  ## Constraints
+
+  - **English only.**
+  - **No filler text.** No "this section will document …" / "TODO". If
+    you have nothing to say in a section, write "none" or omit it.
+  - Do not propose alternative skeletons or architectures — there is
+    exactly one for the chosen cloud.
+  - **Every cost / version / quota** you cite must come from the
+    skeleton README or be flagged "(estimate)". No hand-waved numbers.
+  - **Output discipline (mandatory):** when done, print on its own line:
+    `WROTE {{ overview_path }}`
+    Do not call any cleanup tool (TaskStop, Monitor stop) before that
+    marker. Bash greps stdout for it; a wedged cleanup before the marker
+    records the recipe as failed.

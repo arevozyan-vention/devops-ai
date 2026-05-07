@@ -1,0 +1,249 @@
+# Goose recipe: source-aware preflight + build/push + Container App update +
+# self-healing loop. Azure-native counterpart of recipes/deploy-app.yaml.
+# Same 6-phase shape; primitives swapped (ACR/Container Apps/Key Vault).
+version: "1.0.0"
+title: "Deploy application (Azure, source-aware + self-healing)"
+description: "Read app contracts → pre-fix obvious mismatches → build/push → update Container App → self-heal up to 8 attempts (3/category)."
+temperature: 0.1
+max_turns: 300
+parameters:
+  - { key: repo_name,           input_type: string, requirement: required, description: "Project name." }
+  - { key: source_path,         input_type: string, requirement: required, description: "Absolute path to the repository source tree." }
+  - { key: region,              input_type: string, requirement: required, description: "Azure region (e.g. eastus, westeurope)." }
+  - { key: env,                 input_type: string, requirement: required, description: "Environment name (dev for now)." }
+  - { key: outputs_path,        input_type: string, requirement: required, description: "JSON with acr_login_server, container_app_name, resource_group_name, key_vault_name, postgres_fqdn, etc." }
+  - { key: history_path,        input_type: string, requirement: required, description: "Append-only deploy log (JSONL)." }
+  - { key: iac_dir,             input_type: string, requirement: required, description: "Path to the project's IaC tree." }
+  - { key: attempts_path,       input_type: string, requirement: required, description: "Append-only Markdown log of pre-fixes + self-heal attempts." }
+  - { key: failure_report_path, input_type: string, requirement: required, description: "Where a structured failure report is written if all attempts fail." }
+  - { key: git_ref,             input_type: string, requirement: optional, default: "", description: "Optional branch/tag/SHA. If empty, build current HEAD." }
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are deploying an application to already-provisioned **Azure** infrastructure
+  (Container Apps + Postgres Flexible + ACR + Key Vault). This step does
+  proactive preparation (read app contracts, pre-fix obvious mismatches),
+  builds container images, pushes them to ACR, updates the Container App
+  to the new image, then runs a SELF-HEALING LOOP until the app is healthy
+  or the budget is exhausted.
+
+  ## Inputs
+
+  - Project: {{ repo_name }}     Source: {{ source_path }}     Env: {{ env }}     Region: {{ region }}
+  - Infra outputs (JSON): {{ outputs_path }}
+  - IaC tree (read-only): {{ iac_dir }}
+  - Append logs to: {{ attempts_path }}    History JSONL: {{ history_path }}
+  - On total failure write: {{ failure_report_path }}
+  - Optional ref: {{ git_ref }}
+
+  ## DO NOT use Monitor / background tail for long-running commands
+
+  `az` and `docker` calls have definite endings. Run synchronously with
+  generous timeouts (`timeout_secs=3600`). Never tail a log under Monitor —
+  the underlying process exits and the tail hangs forever. This recipe has
+  hung 30+ minutes that way before; do not repeat.
+
+  ## Phase 1 — Preflight (read everything before doing anything)
+
+  1.1. Read `{{ outputs_path }}`. Capture: `acr_login_server`,
+       `acr_name`, `container_app_name`, `resource_group_name`,
+       `key_vault_name`, `postgres_fqdn`, `postgres_admin_username`,
+       `db_name`, `identity_client_id`, plus optional frontend/redis/queue
+       fields if those extensions were enabled.
+  1.2. Verify Azure identity: `az account show -o json`. The subscription
+       must match what `apply-infra` ran against (look in
+       `{{ iac_dir }}/inputs.yaml :: subscription_id`). If it doesn't,
+       STOP and report — do NOT push images to a different subscription.
+  1.3. Verify ACR access: `az acr login --name <acr_name>` (uses the
+       active az session). If it fails, STOP — fix az creds and retry.
+
+  ## Phase 1.5 — Source intel (read app contracts)
+
+  Read enough of `{{ source_path }}` to KNOW (don't guess) the following:
+
+  - **Dockerfile presence + target stage** (multi-stage often has `run`
+    or `runtime` stage; pick the one that runs the app, not the build stage)
+  - **Container port** the app actually listens on (grep for
+    `listen|PORT|server.listen|app.listen|HOST=0.0.0.0`)
+  - **Health endpoint path** (grep for `/health|/healthz|/api/v1/health|
+    /readyz|/ping`; if multiple, pick the one without auth)
+  - **Postgres SSL requirement** (most ORMs default to require SSL with
+    Azure Postgres Flexible)
+  - **Required env vars** (read `.env.example`, `.env.sample`, README)
+  - **Migrations** (auto-on-boot vs separate command)
+  - **Redis / queue requirements** if those extensions are off (some apps
+    refuse to start without a queue mode env var)
+
+  Write a 6-bullet "Intel summary" to stdout before continuing.
+
+  ## Phase 1.7 — Pre-fix obvious mismatches BEFORE first build
+
+  Apply these from a fixed whitelist (each maps to a single category that
+  the self-heal loop also tracks). Each pre-fix counts toward category
+  budget too — if you've used 3 in pre-fix, self-heal can't add more in
+  that category.
+
+  Whitelist (Azure variant):
+
+  | # | Category   | Trigger                                      | Fix command |
+  |---|-----------|----------------------------------------------|-------------|
+  | 1 | env       | Missing required env in container app        | `az containerapp update -n <app> -g <rg> --set-env-vars KEY=VAL` |
+  | 2 | env       | App needs `AP_QUEUE_MODE=MEMORY` etc.         | same |
+  | 3 | secret    | Empty Key Vault secret blocks startup         | `az keyvault secret set --vault-name <kv> --name <n> --value <v>` |
+  | 4 | secret    | DB password slot not populated                | derive from `postgres_admin_password` output and store in KV |
+  | 5 | sslmode   | App requires SSL flag for Postgres            | add `PGSSLMODE=require` env (or ORM-specific) |
+  | 6 | port      | container_port differs from probe port        | `az containerapp ingress update -n <app> -g <rg> --target-port <p>` |
+  | 7 | probe     | Wrong health path on probes                   | edit Container App YAML: probe path |
+  | 8 | grace     | Slow boot fails liveness too early            | bump `initialDelaySeconds` on probes |
+  | 9 | scale     | min_replicas=0 caused startup race            | `az containerapp update -n <app> -g <rg> --min-replicas 1` |
+  | 10| image-tag | Latest tag stale                              | rebuild + `--image <acr>/<repo>:<sha>` |
+  | 11| identity  | Container App can't pull from ACR             | re-grant AcrPull on the user-assigned identity |
+  | 12| identity  | Container App can't read KV secret            | re-grant `Key Vault Secrets User` |
+  | 13| dns       | App resolves wrong Postgres host              | set `DB_HOST=<postgres_fqdn>` env |
+  | 14| migration | Migrations don't auto-run                     | add an init container that runs migration command |
+  | 15| revision  | Stuck old revision serving traffic            | `az containerapp revision deactivate --revision <old>` |
+  | 16| logs      | Need to read logs to diagnose                 | `az containerapp logs show -n <app> -g <rg> --tail 200` |
+  | 17| acr-auth  | Manifest pull 401                             | `az acr token` refresh + `az acr login` |
+  | 18| ingress   | Ingress not external                          | `az containerapp ingress enable -n <app> -g <rg> --type external --target-port <p>` |
+  | 19| dns       | Custom domain HTTPS cert pending              | wait + `az containerapp hostname add` retries |
+  | 20| size      | OOM at boot                                   | `az containerapp update -n <app> -g <rg> --cpu 1.0 --memory 2.0Gi` (cap at 2.0Gi/1.5Gi/2.0vCPU pairs) |
+
+  Forbidden ops in pre-fix and self-heal:
+  - **No IaC edits.** Do not touch `{{ iac_dir }}` files.
+  - **No role-assignment expansion** beyond what identity module already grants.
+  - **No destruction** (`az containerapp delete`, `az group delete`, etc.).
+  - **No cross-subscription writes.**
+
+  Each pre-fix → append a row to `{{ attempts_path }}` with timestamp,
+  category, exact command, result.
+
+  ## Phase 2 — Build & push
+
+  2.1. Capture git SHA: `git -C {{ source_path }} rev-parse HEAD` (or
+       checkout `{{ git_ref }}` first if non-empty). Tree must be clean.
+  2.2. `az acr login --name <acr_name>`
+  2.3. Build for `linux/amd64` (Azure Container Apps runs amd64; cross-arch
+       on Apple Silicon adds ~5-10 min):
+       ```
+       docker buildx build --platform linux/amd64 \
+         --target run \
+         -t <acr_login_server>/{{ repo_name }}:<sha> \
+         -t <acr_login_server>/{{ repo_name }}:latest \
+         --push <source_path>
+       ```
+  2.4. Verify pushed: `az acr repository show-tags --name <acr_name> --repository {{ repo_name }} -o tsv | head`
+
+  ## Phase 3 — Update Container App + smoke test
+
+  3.1. Update the app to the new image:
+       ```
+       az containerapp update \
+         --name <container_app_name> \
+         --resource-group <resource_group_name> \
+         --image <acr_login_server>/{{ repo_name }}:<sha>
+       ```
+       This creates a new revision automatically.
+  3.2. Wait for the new revision to be stable. Poll every 10s, max 10
+       minutes:
+       ```
+       az containerapp revision list -n <app> -g <rg> -o json
+       ```
+       Look for: latest revision `provisioningState=Provisioned`,
+       `runningState=Running`, `trafficWeight=100`.
+  3.3. Smoke test against the public FQDN:
+       ```
+       FQDN=$(az containerapp show -n <app> -g <rg> --query properties.configuration.ingress.fqdn -o tsv)
+       curl -fsS --max-time 10 "https://$FQDN<health_path>"
+       ```
+       2xx = success.
+
+  If 3.3 succeeds → Phase 5.
+  If 3.3 fails or revision never becomes Running → Phase 4.
+
+  ## Phase 4 — Self-heal loop (max 8 attempts; 3 per category)
+
+  Counter at the top of `{{ attempts_path }}` — read+write each iteration.
+
+  Each attempt:
+
+  4.1. **Diagnose** (must do, no skipping):
+       - `az containerapp logs show -n <app> -g <rg> --tail 200`
+       - `az containerapp revision show -n <app> --revision <latest> -g <rg> -o json`
+         (look at `provisioningState`, `replicas`, `template.containers[].args/env`)
+       - Probe the Container App directly via the static IP if FQDN
+         resolution is suspect.
+
+  4.2. **Classify** the symptom against one of the 20 whitelist rows.
+       If no row matches → write failure report and stop (Phase 6).
+
+  4.3. **Apply the fix** from that row. One whitelist row = one attempt.
+
+  4.4. **Wait + re-test** (Phase 3 step 3.2 + 3.3).
+
+  4.5. **Log** the attempt to `{{ attempts_path }}`:
+  ```
+  ## Attempt <N> — <iso8601>
+  **Category:** <name>  (counter: <X/3 in this category>)
+  **Symptom:** <one-line summary; quote the key error line>
+  **Diagnose output:** <≤10 lines of the most relevant log/event/show output>
+  **Classification:** <which whitelist row matched>
+  **Fix applied:** <exact az/docker commands run>
+  **Result:** healthy after <Ns> | still failing → see attempt <N+1> | giving up → Phase 6
+  ```
+
+  Update the live counter block at the top of attempts.md after writing.
+
+  ## Phase 5 — Success
+
+  **ORDER OF OPERATIONS IS MANDATORY.** Print summary FIRST, success
+  marker SECOND, cleanup LAST. A real incident lost a successful Azure
+  deploy because the model called TaskStop on a lingering Monitor BEFORE
+  emitting `APP DEPLOYED` and bash recorded the recipe as failed.
+
+  5.1. Print `## Access summary` to stdout (only fields with known values):
+  - **Application URL**: `https://<container_app_fqdn>/`
+  - **API health**:      `https://<container_app_fqdn><health_path>`
+  - **Backend image**:   `<acr_login_server>/{{ repo_name }}:<sha>`
+  - **Frontend image**:  if include_frontend
+  - **Backend logs**:    `az containerapp logs show -n <app> -g <rg> --tail 200`
+  - **Pre-fixes applied**: M
+  - **Self-heal attempts**: N (full log: {{ attempts_path }})
+
+  5.2. Append to `{{ history_path }}`:
+  ```json
+  {"ts":"<iso8601>","git_sha":"<sha>","backend_image":"<acr>/<repo>:<sha>",
+   "frontend_image":"<acr_fe>/<repo>-fe:<sha-or-null>","env":"{{ env }}",
+   "region":"{{ region }}","cloud":"azure","attempts":<N>,"prefixes":<M>,"result":"success"}
+  ```
+
+  5.3. **Print the success marker on its own line, IMMEDIATELY after 5.2:**
+  - Single-service: `APP DEPLOYED image=<acr_login_server>/{{ repo_name }}:<sha>`
+  - Multi-service:  `APP DEPLOYED backend=<uri> frontend=<uri>`
+
+  5.4. Cleanup is optional and ALWAYS comes after 5.3.
+
+  ## Phase 6 — Total failure (budget exhausted, or unrecoverable)
+
+  6.1. Write `{{ failure_report_path }}` with sections: Status, What was
+       tried (verbatim from attempts.md), Categories exhausted, Root
+       cause (plain English), Categorization (one of: Missing dependency
+       service / Missing external SaaS account / Architectural
+       incompatibility / Scale beyond skeleton / Upstream code bug /
+       Requires infrastructure change / Ambiguous monorepo layout /
+       Missing infrastructure outputs / Unrecognized failure),
+       Recommended actions, Logs and resources, Operator next steps.
+
+  6.2. Append failed JSON to `{{ history_path }}`.
+
+  6.3. Print `APP DEPLOY FAILED` on its own line and stop. Then cleanup.
+
+  ## Constraints
+
+  - **English only** in all docs and stdout summaries.
+  - Read `{{ outputs_path }}` ONCE at start; do NOT write to it.
+  - The `aws-api` MCP toggle does not apply here — Azure operations
+    happen via `az` CLI through the developer MCP. The `terraform` MCP is
+    OFF for this recipe by framework convention.
+  - Before any cleanup tool (TaskStop / Monitor stop), the success
+    marker `APP DEPLOYED` MUST already be in stdout.

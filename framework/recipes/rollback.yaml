@@ -1,0 +1,99 @@
+# Goose recipe: roll back to the previous successful deploy.
+# Source of truth for the prompt body: framework/prompts/rollback.md.tmpl
+version: "1.0.0"
+title: "Rollback application"
+description: "Switch the runtime back to the most recent successful image. No rebuild."
+# Tuned for Opus 4.7. Zero temp — rollback is a strict, reversible action.
+temperature: 0.0
+max_turns: 40
+parameters:
+  - key: repo_name
+    input_type: string
+    requirement: required
+    description: "Project name (matches projects/<name>/)."
+  - key: region
+    input_type: string
+    requirement: required
+    description: "AWS region (e.g. us-east-1)."
+  - key: env
+    input_type: string
+    requirement: required
+    description: "Environment name: dev / stage / prod."
+  - key: outputs_path
+    input_type: string
+    requirement: required
+    description: "Path to projects/<repo>/deploy/outputs.json."
+  - key: history_path
+    input_type: string
+    requirement: required
+    description: "Path to projects/<repo>/deploy/history.jsonl."
+  - key: previous_image
+    input_type: string
+    requirement: required
+    description: "Image URL the framework resolved as the last successful deploy."
+extensions:
+  - type: builtin
+    name: developer
+prompt: |
+  You are rolling back the application to the previous successful deploy. The
+  previous image already exists in ECR — you do not rebuild. You only point the
+  runtime at the older image and verify health.
+
+  ## Inputs
+
+  - Repository name: {{ repo_name }}
+  - AWS region: {{ region }}
+  - Environment: {{ env }}
+  - Stack outputs (read-only): {{ outputs_path }}
+  - Deploy history (read+append): {{ history_path }}
+  - Image to roll back to: {{ previous_image }}
+     Pre-resolved by the framework as the most recent record in
+     `{{ history_path }}` whose `result == "success"` excluding the current one.
+     If empty, stop and report — there is no rollback target.
+
+  ## Task
+
+  1. Sanity-check the target image exists in ECR:
+     ```
+     aws ecr describe-images --region {{ region }} \
+       --repository-name <name-from-outputs> \
+       --image-ids imageTag=<tag-from-{{ previous_image }}>
+     ```
+     If the image is missing, stop. Do not pick a different image without
+     operator confirmation.
+
+  2. Show the operator a concise diff:
+     - currently deployed image (read from the last record in `{{ history_path }}`)
+     - target rollback image: `{{ previous_image }}`
+     - approximate age of the target deploy (from history `ts`)
+
+  3. **Stop and require explicit approval.** The operator must type `rollback`
+     (case-insensitive). For `{{ env }} == prod`, require `rollback prod`.
+
+  4. On approval, update the runtime to point at `{{ previous_image }}`:
+     - ECS: register a new task-def revision with the old image, force-new-deployment,
+       wait services-stable.
+     - EKS: `kubectl set image ... = {{ previous_image }}`, wait rollout status.
+     - Lambda: `aws lambda update-function-code --image-uri {{ previous_image }}`,
+       wait function-updated.
+
+  5. Smoke-test:
+     - ALB: 3 successive HTTP 2xx on `/health` (or `/`).
+     - Lambda: one invoke with minimal payload, non-error.
+
+  6. Append to `{{ history_path }}`:
+     ```json
+     {"ts":"<iso8601>","git_sha":"<sha-of-target>","image":"{{ previous_image }}",
+      "env":"{{ env }}","region":"{{ region }}","result":"success|failed",
+      "details":"rollback"}
+     ```
+
+  ## Constraints
+
+  - Output language: **English only**.
+  - Do not rebuild any image.
+  - Do not modify IaC.
+  - If the runtime fails to stabilize after rollback, stop and report. Do not
+    attempt a forward redeploy automatically.
+  - When done, print one line:
+    `ROLLED BACK {{ env }} -> {{ previous_image }}` and stop.
