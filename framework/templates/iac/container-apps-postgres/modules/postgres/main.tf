@@ -1,8 +1,19 @@
+# Legacy fallback only — generated when no `admin_password` is wired in via
+# Terragrunt dependency from the secrets module. With proper wiring, the
+# password comes from the same KV secret the app reads, eliminating drift.
 resource "random_password" "admin" {
+  count            = var.admin_password == "" ? 1 : 0
   length           = 24
   special          = true
   min_special      = 2
   override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+locals {
+  # Single source of truth for the Postgres password: prefer the one passed
+  # in (which the secrets module wrote to KV), fall back to the in-module
+  # random_password for legacy callers.
+  pg_admin_password = var.admin_password != "" ? var.admin_password : random_password.admin[0].result
 }
 
 # Postgres Flexible Server with VNet integration. Cheaper than Single Server,
@@ -15,7 +26,7 @@ resource "azurerm_postgresql_flexible_server" "this" {
   sku_name            = var.sku
 
   administrator_login    = var.admin_username
-  administrator_password = random_password.admin.result
+  administrator_password = local.pg_admin_password
 
   storage_mb                   = var.storage_gib * 1024
   storage_tier                 = var.storage_tier

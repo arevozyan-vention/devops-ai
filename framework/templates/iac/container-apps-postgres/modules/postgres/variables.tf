@@ -51,6 +51,19 @@ variable "admin_username" {
   default = "pgadmin"
 }
 
+# Postgres administrator password. When empty, the module generates a random
+# 24-char password locally (legacy fallback) — this is the historical
+# behaviour but creates drift: the app's KV secret holds an unrelated random
+# value, and the actual DB rejects the app's auth. Pass the same value here
+# that the secrets module wrote to KV (via Terragrunt dependency wiring) so
+# both ends agree by construction.
+variable "admin_password" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "Master DB password. Empty = generate locally (legacy). Pass from secrets module to keep KV and DB in sync."
+}
+
 variable "db_name" {
   type    = string
   default = "appdb"

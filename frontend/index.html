@@ -14,7 +14,7 @@
 
   <!-- Header -->
   <header class="flex items-center justify-between mb-6">
-    <h1 class="text-2xl font-bold">DevOps AI <span class="text-slate-400 text-sm font-normal">— Web UI</span></h1>
+    <h1 class="text-2xl font-bold">DevOps AI</h1>
     <div id="auth-status" class="flex gap-3 text-sm">
       <span id="aws-badge"    class="px-3 py-1 rounded-full bg-slate-200">AWS: …</span>
       <span id="azure-badge"  class="px-3 py-1 rounded-full bg-slate-200">Azure: …</span>
@@ -298,10 +298,10 @@
           <h3 class="font-semibold mb-3">Workflow steps</h3>
           <div id="steps-list" class="space-y-2"></div>
         </div>
-        <!-- Live log -->
-        <div class="bg-slate-900 text-slate-100 rounded-lg p-4 font-mono text-xs h-96 overflow-auto" id="log-pane">
-          <div class="text-slate-500">Logs will stream here once you run a step.</div>
-        </div>
+        <!-- Live log pane removed; full stream is in `docker logs <container>`.
+             Kept as a hidden element so existing app.js `$("#log-pane")` calls
+             don't throw — they append into a sink no one renders. -->
+        <div id="log-pane" class="hidden"></div>
       </div>
 
       <!-- Right: artifacts + danger zone -->
@@ -314,12 +314,6 @@
         <!-- Danger zone — shown only when infra_deployed && env=dev -->
         <div id="danger-zone" class="bg-red-50 border border-red-200 p-5 rounded-lg hidden">
           <h3 class="font-semibold mb-2 text-red-700">⚠ Danger zone</h3>
-          <p class="text-xs text-slate-600 mb-3">
-            Destroy runs <code>terragrunt run-all destroy</code> on this
-            project's environment. <strong>All AWS resources (VPC, RDS,
-            ECS, ALB, secrets, IAM, ECR images) will be deleted.</strong>
-            Not reversible beyond redeploying from scratch.
-          </p>
           <button id="destroy-btn"
                   class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm w-full">
             Destroy infrastructure

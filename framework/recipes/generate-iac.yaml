@@ -71,10 +71,16 @@ prompt: |
   - Variable file used for skeleton render (read-only): {{ vars_yaml }}
   - AWS region: {{ region }}
   - Environment: {{ env }}
-  - **TODO worklist (advisory):** {{ todo_list_path }}
-    The framework grep'd `TODO(devops-ai)` markers as a starting hint.
-    You are NOT required to use this list — verify it's complete by
-    looking yourself, and resolve any markers you find.
+  - **TODO worklist (AUTHORITATIVE):** {{ todo_list_path }}
+    The framework already ran `grep -rn 'TODO(devops-ai)' {{ iac_dir }}`
+    and wrote the COMPLETE list of markers to this file. The result is
+    deterministic — the same grep run again will return identical lines.
+    **Do NOT** run `grep -rn 'TODO(devops-ai)'` yourself. **Do NOT**
+    open files at random looking for additional markers. Trust this
+    list, work the markers in it, then move to verification (step 7
+    below) which is the framework's grep again to confirm completion.
+    Skipping this redundant search saves ~10-20 tool calls per run
+    without affecting output quality.
 
   ## Task
 

@@ -24,6 +24,12 @@ db_engine_version: "{{db_engine_version}}"   # e.g. "16"
 db_name: "{{db_name}}"
 db_admin_username: "{{db_admin_username}}"
 
+# Which Key Vault secret holds the DB master password. Wired into
+# _envcommon/postgres.hcl so Postgres uses the SAME value the app reads
+# (no drift). Default matches the skeleton convention; apps with their
+# own naming convention override here (e.g. "ap-postgres-password").
+db_password_secret_key: "DATABASE_PASSWORD"
+
 # Optional public DNS — if empty, Container App serves on built-in
 # *.<region>.azurecontainerapps.io (HTTPS automatic).
 domain_name: "{{domain_name}}"

@@ -484,7 +484,35 @@ prompt: |
   - **Pre-fixes applied**: M (auto-fixes from Phase 1.7)
   - **Self-heal attempts**: N (full log: {{ attempts_path }})
 
-  5.3. Print one terminal line and stop:
+  5.3. Write the access summary to a Markdown file in the deploy artifacts
+       directory: `<dirname({{ history_path }})>/access.md`. Overwrite any
+       prior content (one file = the latest successful deploy). Use exactly
+       this template; omit any line whose value is unknown:
+
+       ```markdown
+       # Access — {{ repo_name }} / {{ env }} / {{ region }} (aws)
+
+       **Deployed:** <iso8601>
+       **Git SHA:** `<sha>`
+       **Image:** `<backend_uri>`
+
+       ## URLs
+       - **Application**: http(s)://<alb_dns>/
+       - **API health**: http(s)://<alb_dns><health_check_path>
+
+       ## Operations
+       - **Backend logs**: `aws logs tail <backend_log_group> --since 5m --follow`
+       - **Service status**: `aws ecs describe-services --cluster <cluster> --services <service>`
+       - **Force redeploy**: `aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment`
+
+       ## Deploy stats
+       - Pre-fixes applied: M
+       - Self-heal attempts: N — see `deploy_attempts.md`
+       ```
+
+       Keep the file short and operator-actionable. No prose, no narration.
+
+  5.4. Print one terminal line and stop:
   - Single-service: `APP DEPLOYED image=<ecr_url>:<sha>`
   - Multi-service:  `APP DEPLOYED backend=<uri> frontend=<uri>`
 

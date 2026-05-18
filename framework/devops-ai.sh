@@ -151,7 +151,7 @@ _recipe_for_cloud() {
 # experimentation.
 _recipe_model() {
   case "$1" in
-    analyze|recommend|assess|generate-iac|review-iac|infra-plan|\
+    analyze|recommend|assess|generate-iac|infra-plan|\
     infra-apply|deploy-app|upgrade|rollback|audit)
                                      echo "claude-opus-4-7"   ;;
     *)                               echo ""                  ;;
@@ -172,7 +172,6 @@ _recipe_mcp_plan() {
   case "$1" in
     # ---- AWS recipes (default) ------------------------------------------
     analyze|recommend|assess)        echo "aws-api:true  terraform:true"  ;;
-    review-iac)                      echo "aws-api:true  terraform:true"  ;;
     audit)                           echo "aws-api:true  terraform:true"  ;;
     generate-iac)                    echo "aws-api:false terraform:true"  ;;
     infra-plan|infra-apply)          echo "aws-api:true  terraform:true"  ;;
@@ -182,7 +181,7 @@ _recipe_mcp_plan() {
     # aws-api OFF — irrelevant for Azure. terraform MCP stays ON for
     # registry / provider lookups (terragrunt + azurerm provider docs).
     # Operational recipes drop terraform too — they only need `az` via dev MCP.
-    audit-azure|review-iac-azure)    echo "aws-api:false terraform:true"  ;;
+    audit-azure)                     echo "aws-api:false terraform:true"  ;;
     infra-plan-azure|infra-apply-azure) echo "aws-api:false terraform:true" ;;
     deploy-app-azure|upgrade-azure|rollback-azure) echo "aws-api:false terraform:false" ;;
     recommend-azure|assess-azure)    echo "aws-api:false terraform:true"  ;;
@@ -374,6 +373,13 @@ _configure_mcps() {
 # in deploy-infra), the gate lives in shell: a recipe writes a summary file,
 # the bash command pauses with `read -r` against the operator's terminal, and
 # only then the next recipe is invoked. The shell is the gate, not the model.
+# Set on every run_recipe invocation. Empty string after a successful run
+# (logfile already deleted), or a path to the retained logfile after a failed
+# run. Callers that want to inspect the failure log (e.g. cmd_apply_infra
+# scanning for state-lock errors) read this immediately after run_recipe
+# returns non-zero — DO NOT rely on it after any other shell command runs.
+LAST_RECIPE_LOG=""
+
 run_recipe() {
   local recipe="$1" success_re="$2"; shift 2
   local recipe_path="$FRAMEWORK_DIR/recipes/${recipe}.yaml"
@@ -427,7 +433,9 @@ run_recipe() {
 
     if grep -qE "$success_re" "$logfile"; then
       ok "recipe '$recipe' completed (success marker matched)"
+      _print_token_usage "$logfile"
       rm -f "$logfile"
+      LAST_RECIPE_LOG=""
       return 0
     fi
 
@@ -442,6 +450,8 @@ run_recipe() {
   echo "  last 20 lines of the final attempt:" >&2
   tail -20 "$logfile" >&2
   echo "  full log retained at: $logfile" >&2
+  _print_token_usage "$logfile"
+  LAST_RECIPE_LOG="$logfile"
   return 1
 }
 
@@ -474,8 +484,6 @@ Workflow commands:
                                --include accepts a comma list of opt-in extensions
                                          (keycloak, alb-https, redis, queue, frontend).
   generate-iac <repo>          Render skeleton + AI completes TODO markers.
-  review-iac <repo>            Self-review of generated IaC (security/cost/policy)
-                               → docs/01_review.md. Run BEFORE plan-infra.
   aws-login                    Helper around 'aws configure sso'.
   aws-bootstrap [<repo>]       Create the S3 tfstate bucket. Without args:
                                creates 'devops-ai-tfstate-<account>'. With
@@ -503,10 +511,9 @@ Inspection:
                                → docs/02_audit.md. Run periodically.
 
 Each step gates on prior state. The command flow is roughly:
-  init → assess → select → generate-iac → review-iac
+  init → assess → select → generate-iac
        → plan-infra → apply-infra → deploy-app
                                   → upgrade / rollback / audit
-  Or shortcut: init → assess → select → generate-iac → ...
 EOF
 }
 
@@ -783,6 +790,30 @@ cmd_generate_iac() {
   local iac_dir; iac_dir="$(project_iac "$repo")"
   local vars_yaml="$iac_dir/inputs.yaml"
 
+  # Cache check — skip the entire recipe (and the rendering wipe-and-rebuild
+  # that precedes it) if every input that affects the IaC output is unchanged
+  # since the last successful run. Saves ~3-5M tokens on a re-run with the
+  # same source / state / skeleton. Cache is invalidated automatically when
+  # any of overview / state / recipe / skeleton tree changes. Force a re-run
+  # by deleting the cache file.
+  local cache_dir; cache_dir="$(project_dir "$repo")/.devops-ai-cache"
+  local cache_file="$cache_dir/generate-iac.key"
+  local current_key cached_key=""
+  current_key="$(_generate_iac_cache_key "$repo" "$skeleton")"
+  [[ -f "$cache_file" ]] && cached_key="$(cat "$cache_file" 2>/dev/null || echo "")"
+
+  if [[ -n "$cached_key" && "$current_key" == "$cached_key" \
+        && -d "$iac_dir/environments" ]]; then
+    ok "generate-iac skipped — inputs unchanged since last successful run"
+    c_dim "    cache key: $current_key"
+    c_dim "    force re-run: rm $cache_file"
+    state_set_bool "$repo" status.iac_generated true
+    step_outro "generate-iac" \
+      "Output:  $iac_dir  (preserved from previous run)" \
+      "Next:    ./devops-ai.sh plan-infra $repo"
+    return 0
+  fi
+
   step "Rendering skeleton '$skeleton' (cloud=$cloud) → $iac_dir"
   rm -rf "$iac_dir"
   mkdir -p "$iac_dir"
@@ -877,7 +908,20 @@ state_container: "$state_container"
 include_custom_domain_https: "$inc_custom_domain_https"
 EOF
   else
-    # AWS
+    # AWS — append a 12-digit random suffix to the tfstate bucket name. S3
+    # bucket names are global; without randomness, deleting the bucket and
+    # re-running bootstrap can race other accounts and (worst case) leak the
+    # account-id-derived name. /dev/urandom over $RANDOM keeps entropy honest.
+    #
+    # NB: do NOT use `tr -dc '0-9' < /dev/urandom | head -c 12`. /dev/urandom
+    # is infinite, so `head` closes stdin after 12 bytes, `tr`'s next write
+    # gets SIGPIPE → exit 141. Under `set -o pipefail` the whole script dies.
+    # We read a bounded pool from /dev/urandom up-front (2048 bytes ≈ 80 digits
+    # after filtering on average; even 5σ below the mean we still get >50,
+    # well over the 12 we need), then slice.
+    local state_bucket_suffix rand_pool
+    rand_pool="$(head -c 2048 /dev/urandom | LC_ALL=C tr -dc '0-9')"
+    state_bucket_suffix="${rand_pool:0:12}"
     cat >> "$tmp_vars" <<EOF
 account_id: "$acct"
 db_master_username: "appuser"
@@ -890,7 +934,7 @@ artifact_bucket: "${repo}-artifacts"
 function_handler: "app.handler"
 dynamo_partition_key: "pk"
 dynamo_sort_key: ""
-state_bucket: "${repo}-tfstate"
+state_bucket: "${repo}-tfstate-${state_bucket_suffix}"
 EOF
   fi
 
@@ -951,12 +995,21 @@ EOF
   fi
 
   state_set_bool "$repo" status.iac_generated true
+
+  # Persist cache key — next run with identical inputs will skip the recipe
+  # and reuse the existing iac/ tree. The hash includes overview.md,
+  # state.yaml, recipe yaml, and the full skeleton tree (see
+  # `_generate_iac_cache_key`), so any meaningful change invalidates cache
+  # automatically. We only write AFTER the recipe success marker so a
+  # failed/partial run won't poison future cache lookups.
+  mkdir -p "$cache_dir"
+  echo "$current_key" > "$cache_file"
+
   ok "IaC ready in $iac_dir"
   step_outro "generate-iac" \
     "Output:  $iac_dir  (Terragrunt units in environments/dev/, modules/ tree)" \
     "         (open the IAC group in UI artifacts to inspect)" \
-    "Next:    ./devops-ai.sh review-iac $repo   (optional: AI security/correctness review)" \
-    "         OR ./devops-ai.sh plan-infra $repo   (skip review, go straight to plan)"
+    "Next:    ./devops-ai.sh plan-infra $repo"
 }
 
 cmd_aws_login() {
@@ -1275,6 +1328,118 @@ for m in pattern.finditer(log):
 PY
 }
 
+# Format an integer token count as 1.2K / 3.4M for compact display.
+# Falls through to the raw value for non-numeric input or <1000. Awk's
+# rounding is used so 999500 displays as "1.0M" instead of "999.5K", and
+# the K→M boundary doesn't get a confusing "1000.0K" line.
+_fmt_tokens() {
+  local n="${1:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { echo "$n"; return; }
+  if (( n >= 999500 )); then
+    awk -v n="$n" 'BEGIN { printf "%.1fM", n/1000000 }'
+  elif (( n >= 1000 )); then
+    awk -v n="$n" 'BEGIN { printf "%.1fK", n/1000 }'
+  else
+    echo "$n"
+  fi
+}
+
+# Print token usage for the goose session captured in <logfile>. Best-effort:
+# silently skips if sqlite3, the goose sessions DB, or the session ID line
+# can't be found. Uses tail -1 on the session-ID grep so retried recipes
+# show the LAST attempt's tokens, not the first one.
+#
+# We display only `total_tokens` — goose's `input_tokens`/`output_tokens`
+# columns hold only the LAST request/response pair, not cumulative sums,
+# so they're misleading on multi-turn sessions (a 2M-token recipe shows
+# input=53 because the final user message was tiny).
+#
+# Args: <logfile>
+_print_token_usage() {
+  local logfile="$1"
+  [[ -s "$logfile" ]] || return 0
+  local db="$HOME/.local/share/goose/sessions/sessions.db"
+  [[ -f "$db" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+
+  # Goose stamps the session ID in stdout right after "new session":
+  #     __( O)>  ● new session · claude-acp claude-opus-4-7
+  #    \____)    20260507_2 · /workspace
+  local session_id
+  session_id="$(grep -oE '[0-9]{8}_[0-9]+' "$logfile" | tail -1)"
+  [[ -n "$session_id" ]] || return 0
+
+  local total
+  total="$(sqlite3 "$db" \
+    "SELECT total_tokens FROM sessions WHERE id = '$session_id';" \
+    2>/dev/null)" || return 0
+  [[ "$total" =~ ^[0-9]+$ ]] || return 0
+
+  c_dim "    tokens: $(_fmt_tokens "$total") (session $session_id)"
+}
+
+# Scan a terragrunt log for state-lock errors, force-unlock each affected
+# unit, and echo the count of successful unlocks to stdout. Cloud-agnostic:
+# `terragrunt force-unlock` delegates to the configured backend (S3 lockfile
+# for AWS, blob lease for Azure). Returns 0 always — caller decides whether
+# to retry based on the count.
+#
+# Args: <logfile> <iac_dir> <env>
+_recover_state_locks() {
+  local logfile="$1" iac_dir="$2" env="$3"
+  [[ -s "$logfile" ]] || { echo 0; return 0; }
+  grep -q "Error acquiring the state lock" "$logfile" || { echo 0; return 0; }
+
+  local unit lid swept=0
+  while IFS=$'\t' read -r unit lid; do
+    [[ -z "$unit" || -z "$lid" ]] && continue
+    local unit_dir="$iac_dir/environments/$env/$unit"
+    [[ -d "$unit_dir" ]] || { warn "  skip '$unit' — directory not found" >&2; continue; }
+    warn "  force-unlock unit='$unit' id=$lid" >&2
+    if (cd "$unit_dir" && terragrunt force-unlock "$lid" --non-interactive >/dev/null 2>&1); then
+      ok "    unit '$unit' unlocked" >&2
+      swept=$((swept + 1))
+    else
+      warn "    force-unlock returned non-zero (already free, or wrong id)" >&2
+    fi
+  done < <(_extract_lock_pairs "$logfile")
+
+  echo "$swept"
+}
+
+# Compute a stable SHA256 of every input that affects generate-iac's output.
+# If the hash matches the previously-recorded one, the AI step would produce
+# identical IaC — so cmd_generate_iac can skip the recipe entirely (saving
+# ~3-5M tokens on a re-run with unchanged source/inputs).
+#
+# Hashed inputs:
+#   - 00_overview.md  — captures app contract (from `assess`)
+#   - state.yaml      — captures env/cloud/region/extensions/source_path
+#   - recipe yaml     — captures workflow definition
+#   - skeleton tree   — captures templates, provider pins, module code
+#
+# inputs.yaml is INTENTIONALLY omitted: it's derived deterministically from
+# state.yaml + skeleton's inputs.yaml.tmpl, both already in the hash.
+#
+# Cache hits are safe by construction: same hash = same inputs = same output.
+# sha256 collisions are practically impossible (2^256 keyspace).
+_generate_iac_cache_key() {
+  local repo="$1"
+  local skeleton="$2"
+  local overview_path; overview_path="$(project_docs "$repo")/00_overview.md"
+  local state_file;    state_file="$(project_dir "$repo")/state.yaml"
+  local recipe_yaml="$FRAMEWORK_DIR/recipes/generate-iac.yaml"
+  local skeleton_dir="$FRAMEWORK_DIR/templates/iac/$skeleton"
+
+  {
+    [[ -f "$overview_path" ]] && sha256sum "$overview_path"
+    [[ -f "$state_file"    ]] && sha256sum "$state_file"
+    [[ -f "$recipe_yaml"   ]] && sha256sum "$recipe_yaml"
+    [[ -d "$skeleton_dir"  ]] && find "$skeleton_dir" -type f -print0 2>/dev/null \
+        | sort -z | xargs -0 -r sha256sum 2>/dev/null
+  } | sha256sum | awk '{print $1}'
+}
+
 _file_mtime_epoch() {
   # mtime as unix epoch. Try GNU stat first (Linux containers),
   # then BSD stat (macOS). The previous order was reversed which
@@ -1388,14 +1553,44 @@ _infra_phase_gate_and_apply() {
   ok "approval received — running apply"
 
   local cloud; cloud="$(state_get "$repo" cloud 2>/dev/null || echo "aws")"
-  run_recipe infra-apply "INFRA DEPLOYED env=${env} region=${region}" \
-    "repo_name=$repo" \
-    "iac_dir=$iac_dir" \
-    "env=$env" \
-    "region=$region" \
-    "cloud=$cloud" \
-    "plan_summary_path=$plan_summary_path" \
+
+  # Apply with one-shot force-unlock retry. A previous interrupted apply
+  # (Ctrl-C, container crash, OOM, killed Goose Monitor) leaves a state
+  # lock that blocks every subsequent apply until cleared. We scan the
+  # recipe's failure log for "Error acquiring the state lock", pull the
+  # lock-id + unit pairs, force-unlock, and retry once. Mirrors cmd_destroy.
+  local apply_args=(
+    "repo_name=$repo"
+    "iac_dir=$iac_dir"
+    "env=$env"
+    "region=$region"
+    "cloud=$cloud"
+    "plan_summary_path=$plan_summary_path"
     "outputs_path=$outputs_path"
+  )
+  local apply_marker="INFRA DEPLOYED env=${env} region=${region}"
+
+  set +e
+  run_recipe infra-apply "$apply_marker" "${apply_args[@]}"
+  local apply_rc=$?
+  set -e
+
+  if (( apply_rc != 0 )); then
+    local swept=0
+    if [[ -n "${LAST_RECIPE_LOG:-}" && -s "$LAST_RECIPE_LOG" ]]; then
+      swept="$(_recover_state_locks "$LAST_RECIPE_LOG" "$iac_dir" "$env")"
+    fi
+    [[ -n "${LAST_RECIPE_LOG:-}" ]] && rm -f "$LAST_RECIPE_LOG"
+    LAST_RECIPE_LOG=""
+
+    if (( swept > 0 )); then
+      step "Retrying apply-infra after $swept force-unlock(s)"
+      run_recipe infra-apply "$apply_marker" "${apply_args[@]}" \
+        || die "apply-infra still failing after $swept force-unlock(s) — see output above"
+    else
+      die "apply-infra failed (no recoverable state-lock issue) — see output above"
+    fi
+  fi
 
   # Re-merge outputs deterministically. The recipe used to instruct the LLM
   # to run `terragrunt run --all output -- -json > outputs.json`, but that
@@ -1510,40 +1705,6 @@ cmd_assess() {
   state_set_bool "$repo" status.recommended true
   ok "overview → $overview_path"
   ok "next: ./devops-ai.sh select $repo --cloud $cloud --region <r> --env <e>"
-}
-
-# review-iac — Opus self-reviews freshly generated IaC for security, cost,
-# correctness, and policy issues BEFORE plan-infra. Writes 01_review.md;
-# does not block plan-infra automatically — operator decides.
-cmd_review_iac() {
-  local repo="${1:-}"; ensure_param "<repo>" "$repo"
-  preflight_generate_iac "$repo"
-  state_check "$repo" iac_generated
-  local iac_dir; iac_dir="$(project_iac "$repo")"
-  local docs; docs="$(project_docs "$repo")"
-  local overview_path="$docs/00_overview.md"
-  local out_path="$docs/01_review.md"
-  local state_yaml; state_yaml="$(project_dir "$repo")/state.yaml"
-
-  local cloud; cloud="$(state_get "$repo" cloud 2>/dev/null || echo "aws")"
-
-  step_intro "review-iac" \
-    "1-3 minutes" \
-    "AI walks the generated iac/ tree and flags security / cost / correctness issues before any ${cloud^^} call."
-
-  run_recipe review-iac "WROTE ${out_path}" \
-    "repo_name=$repo" \
-    "iac_dir=$iac_dir" \
-    "overview_path=$overview_path" \
-    "output_path=$out_path" \
-    "state_yaml=$state_yaml" \
-    "cloud=$cloud"
-
-  [[ -s "$out_path" ]] || die "review-iac: $out_path empty"
-  ok "review → $out_path"
-  step_outro "review-iac" \
-    "Output:  $out_path  (read this — anything red/yellow blocks plan-infra)" \
-    "Next:    ./devops-ai.sh plan-infra $repo"
 }
 
 # audit — drift / posture check against deployed AWS resources. Reads
@@ -1846,10 +2007,12 @@ _purge_ecr_images() {
       ids="$(jq -c '.imageIds // []' <<< "$list_json")"
       local n; n="$(jq 'length' <<< "$ids")"
       if (( n > 0 )); then
-        aws ecr batch-delete-image --repository-name "$rname" --region "$region" \
-          --image-ids "$ids" --output json >/dev/null 2>&1 \
-          && c_dim "  $rname — deleted $n image(s)" \
-          || warn "  $rname — batch-delete returned non-zero (some may have been deleted)"
+        if aws ecr batch-delete-image --repository-name "$rname" --region "$region" \
+            --image-ids "$ids" --output json >/dev/null 2>&1; then
+          c_dim "  $rname — deleted $n image(s)"
+        else
+          warn "  $rname — batch-delete returned non-zero (some may have been deleted)"
+        fi
         purged_total=$((purged_total + n))
         page_count=$((page_count + 1))
       fi
@@ -1898,9 +2061,11 @@ _purge_acr_repositories() {
     local rep
     while IFS= read -r rep; do
       [[ -z "$rep" ]] && continue
-      az acr repository delete --name "$rname" --repository "$rep" --yes -o none 2>/dev/null \
-        && c_dim "  $rname — deleted repository '$rep'" \
-        || warn "  $rname — failed to delete repository '$rep' (will let terraform try)"
+      if az acr repository delete --name "$rname" --repository "$rep" --yes -o none 2>/dev/null; then
+        c_dim "  $rname — deleted repository '$rep'"
+      else
+        warn "  $rname — failed to delete repository '$rep' (will let terraform try)"
+      fi
       purged_total=$((purged_total + 1))
     done <<< "$repo_names"
   done < <(jq -r '.[] | "\(.name)\t\(.rg)"' <<< "$registries_json")
@@ -2016,7 +2181,6 @@ main() {
     assess)                cmd_assess "$@" ;;
     select)                cmd_select "$@" ;;
     generate-iac)          cmd_generate_iac "$@" ;;
-    review-iac)            cmd_review_iac "$@" ;;
     audit)                 cmd_audit "$@" ;;
     aws-login)             cmd_aws_login "$@" ;;
     aws-bootstrap)         cmd_aws_bootstrap "$@" ;;

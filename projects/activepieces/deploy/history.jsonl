@@ -1,1 +1,0 @@
-{"ts":"2026-05-07T16:20:00Z","git_sha":"e909bef6e3ac19955a8d81732e7e2155930b5bf8","backend_image":"activepiecesdevacr.azurecr.io/activepieces:e909bef6e3ac19955a8d81732e7e2155930b5bf8","frontend_image":null,"env":"dev","region":"westus3","cloud":"azure","attempts":3,"prefixes":2,"result":"success"}

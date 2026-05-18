@@ -22,3 +22,13 @@ output "secret_uris" {
     k => "${azurerm_key_vault.this.vault_uri}secrets/${s.name}"
   }
 }
+
+# Plaintext values, exposed so the postgres module can wire the same value
+# as `administrator_password` and avoid drift where Postgres has one random
+# password while the app's KV secret holds a different one. Sensitive —
+# Terragrunt won't print it in plan output.
+output "secret_values_by_key" {
+  description = "Map from secret name to its current generated value."
+  value       = { for k in toset(var.secret_names) : k => random_id.secret_value[k].hex }
+  sensitive   = true
+}

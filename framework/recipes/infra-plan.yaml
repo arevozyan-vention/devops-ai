@@ -62,9 +62,27 @@ prompt: |
      Tee output: `terragrunt run --all plan --non-interactive | tee /tmp/tg_plan.log`
      Wait for it to return. Read exit code.
 
-  4. **Parse, do not summarize.** Extract from terragrunt stdout:
+  3.5. **Pre-filter the plan output before reading.** Terragrunt's stdout
+       contains ~50 attribute-dump lines per resource ("+ arn = (known
+       after apply)" etc.) that the schema-style summary does NOT use.
+       Filter to just the lines step 4 needs — Plan: counts, "will be
+       created/destroyed/updated" headers, and `+ resource` block
+       headers. This cuts plan-data tokens by ~80-90% with zero info
+       loss for our schema output:
+       ```
+       grep -E 'Plan: [0-9]+ to add|will be (created|destroyed|updated)|[+~-] resource "' \
+         /tmp/tg_plan.log > /tmp/tg_plan_summary.txt
+       ```
+       Read `/tmp/tg_plan_summary.txt` in step 4. The full
+       `/tmp/tg_plan.log` stays on disk for debugging — do NOT read it
+       directly; it costs 5-50K tokens of attribute noise that the
+       schema output doesn't use.
+
+  4. **Parse, do not summarize.** Extract from `/tmp/tg_plan_summary.txt`:
      - Per-unit `Plan: N to add, M to change, K to destroy.` lines
      - Resource names from `+ resource "TYPE" "NAME"` blocks (per unit)
+     The filtered file is line-for-line a subset of the raw plan output —
+     same source of truth, no fabrication risk.
 
   5. **Write the schema-style summary.** Use the structure below verbatim.
 

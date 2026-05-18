@@ -25,6 +25,12 @@ db_engine_version: "{{db_engine_version}}"
 db_name: "{{db_name}}"
 db_master_username: "{{db_master_username}}"
 
+# Which Secrets Manager key holds the DB master password. Wired into
+# _envcommon/rds.hcl so RDS uses the SAME value the app reads (no drift).
+# Default "DATABASE_PASSWORD" matches the skeleton's secret_keys list. Apps
+# with their own naming convention override here (e.g. "AP_POSTGRES_PASSWORD").
+db_password_secret_key: "DATABASE_PASSWORD"
+
 # Optional public DNS — if empty, ALB will serve plain HTTP (dev only).
 domain_name: "{{domain_name}}"
 

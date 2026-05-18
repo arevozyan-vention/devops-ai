@@ -544,12 +544,124 @@ def build_cli_args(action: str, repo: str, payload: dict) -> list[str]:
 
 VALID_ACTIONS = {
     "init", "assess", "analyze", "recommend", "select",
-    "generate-iac", "review-iac",
+    "generate-iac",
     "aws-bootstrap", "az-bootstrap",
     "plan-infra", "apply-infra", "deploy-infra",
     "deploy-app", "rollback", "upgrade", "destroy", "audit",
     "status",
 }
+
+
+# Baseline ETA (seconds) per action — used by the UI progress bar when no
+# local history exists yet. Numbers are deliberately on the high side so
+# the % never hits 100 prematurely; the bar caps at 95% and only jumps to
+# 100 when the success exit code arrives. Tune after observation.
+RECIPE_DEFAULT_ETAS: dict[str, int] = {
+    # Fast / preparation steps
+    "init":          5,
+    "select":        5,
+    "status":        2,
+    "recommend":     60,
+    "aws-bootstrap": 60,
+    "az-bootstrap":  120,
+    # AI-driven discovery / generation
+    "analyze":       180,
+    "assess":        180,
+    "generate-iac":  300,
+    # Read-only checks against cloud APIs
+    "audit":         180,
+    "plan-infra":    300,
+    # Heavy provisioning / app lifecycle
+    "apply-infra":   900,   # 15 min — RDS/Postgres dominate on first apply
+    "deploy-infra":  1200,  # plan + apply combined
+    "deploy-app":    1800,  # 30 min — build/push/ECS update + self-heal
+    "upgrade":       900,
+    "rollback":      600,
+    "destroy":       600,
+}
+
+
+def _goose_db_path() -> Path:
+    """Goose stores per-session token+timing data here; we read it for ETAs."""
+    return Path.home() / ".local/share/goose/sessions/sessions.db"
+
+
+def _action_to_recipe_title(action: str) -> Optional[str]:
+    """Map a CLI action to the recipe `title:` field Goose persists in sessions.
+    Returns None for actions that don't run a recipe (init/select/bootstrap).
+    None → caller falls back to default ETA only."""
+    titles = {
+        "analyze":       "Analyze repository",
+        "assess":        "Assess repository (project + deployment fit)",
+        "recommend":     "Recommend infrastructure",
+        "generate-iac":  "Finish IaC",
+        "plan-infra":    "Plan infrastructure (architecture-schema summary)",
+        "apply-infra":   "Apply infrastructure",
+        "deploy-infra":  "Apply infrastructure",
+        "deploy-app":    "Deploy application (source-aware + self-healing)",
+        "audit":         "Audit deployed infrastructure",
+        "upgrade":       "Upgrade application",
+        "rollback":      "Rollback application",
+    }
+    return titles.get(action)
+
+
+@app.get("/api/eta/{action}")
+def get_eta(action: str) -> dict:
+    """Return a baseline ETA for `action`, plus a historical avg when ≥3
+    successful past runs of the same recipe exist locally in Goose's sqlite.
+
+    Response shape:
+        { eta_seconds: int, source: "default" | "historical", samples: int }
+
+    UI uses this on click of a step to drive a `min(95%, elapsed/eta*100)`
+    progress display that monotonically advances until success.
+    """
+    if action not in VALID_ACTIONS:
+        raise HTTPException(404, f"unknown action {action}")
+
+    default_eta = RECIPE_DEFAULT_ETAS.get(action, 300)
+    response = {"eta_seconds": default_eta, "source": "default", "samples": 0}
+
+    # Try to refine with local Goose history. Best-effort: any error
+    # (missing db, missing recipe title, sqlite import quirk) falls through
+    # to the default so the UI still renders a progress bar.
+    db_path = _goose_db_path()
+    title = _action_to_recipe_title(action)
+    if not db_path.exists() or title is None:
+        return response
+
+    try:
+        import sqlite3
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            # Average of last 5 successful runs (total_tokens > 0 filter
+            # excludes sessions that crashed before any work happened).
+            row = conn.execute(
+                """
+                SELECT
+                    CAST(AVG((julianday(updated_at) - julianday(created_at)) * 86400) AS INTEGER),
+                    COUNT(*)
+                FROM (
+                    SELECT created_at, updated_at
+                    FROM sessions
+                    WHERE json_extract(recipe_json, '$.title') = ?
+                      AND total_tokens IS NOT NULL
+                      AND total_tokens > 0
+                    ORDER BY updated_at DESC
+                    LIMIT 5
+                )
+                """,
+                (title,),
+            ).fetchone()
+        if row and row[0] and row[1] >= 3:
+            response["eta_seconds"] = max(int(row[0]), 10)  # floor at 10s
+            response["source"] = "historical"
+            response["samples"] = int(row[1])
+    except Exception:
+        # Silent fallback — keep default.
+        pass
+
+    return response
 
 
 @app.websocket("/ws/run/{action}")
@@ -633,6 +745,14 @@ async def run_action(ws: WebSocket, action: str):
             text = line.decode(errors="replace").rstrip("\n")
             # Strip ANSI escapes for cleaner UI
             text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+            # Mirror every subprocess line to the container's stdout so the
+            # same stream is available via `docker logs <container>` — useful
+            # for long-running recipes (apply-infra, deploy-app) where the
+            # operator wants to tail progress from another terminal without
+            # opening the UI. Prefixed with [<action>] so logs are filterable
+            # via `docker logs | grep apply-infra`. flush=True because uvicorn
+            # buffers stdout under Docker until newline-on-flush.
+            print(f"[{action}] {text}", flush=True)
             try:
                 await ws.send_json({"type": "line", "data": text})
             except (WebSocketDisconnect, RuntimeError):

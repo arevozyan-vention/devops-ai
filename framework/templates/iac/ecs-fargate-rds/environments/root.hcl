@@ -69,9 +69,14 @@ generate "versions" {
 terraform {
   required_version = ">= 1.6.0"
   required_providers {
-    aws    = { source = "hashicorp/aws",    version = "~> 5.70" }
-    random = { source = "hashicorp/random", version = "~> 3.6"  }
-    tls    = { source = "hashicorp/tls",    version = "~> 4.0"  }
+    # Strict pins. The Dockerfile prebake installs the SAME exact versions
+    # into the plugin cache; if these drift apart, a project's
+    # `.terraform.lock.hcl` ends up wanting a version that isn't in the
+    # cache and apply fails with "no package for X cached". Bump in BOTH
+    # places together (Dockerfile prebake + every root.hcl).
+    aws    = { source = "hashicorp/aws",    version = "= 5.100.0" }
+    random = { source = "hashicorp/random", version = "= 3.8.1"   }
+    tls    = { source = "hashicorp/tls",    version = "= 4.2.1"   }
   }
 }
 EOF

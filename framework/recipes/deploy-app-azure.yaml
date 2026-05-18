@@ -210,18 +210,46 @@ prompt: |
   - **Pre-fixes applied**: M
   - **Self-heal attempts**: N (full log: {{ attempts_path }})
 
-  5.2. Append to `{{ history_path }}`:
+  5.2. Write the access summary to a Markdown file in the deploy artifacts
+       directory: `<dirname({{ history_path }})>/access.md`. Overwrite any
+       prior content (one file = the latest successful deploy). Use exactly
+       this template; omit any line whose value is unknown:
+
+       ```markdown
+       # Access — {{ repo_name }} / {{ env }} / {{ region }} (azure)
+
+       **Deployed:** <iso8601>
+       **Git SHA:** `<sha>`
+       **Image:** `<acr_login_server>/{{ repo_name }}:<sha>`
+
+       ## URLs
+       - **Application**: https://<container_app_fqdn>/
+       - **API health**: https://<container_app_fqdn><health_path>
+
+       ## Operations
+       - **Logs**: `az containerapp logs show -n <container_app_name> -g <resource_group_name> --tail 200`
+       - **Revisions**: `az containerapp revision list -n <container_app_name> -g <resource_group_name> -o table`
+       - **Shell**: `az containerapp exec -n <container_app_name> -g <resource_group_name> --command sh`
+
+       ## Deploy stats
+       - Pre-fixes applied: M
+       - Self-heal attempts: N — see `deploy_attempts.md`
+       ```
+
+       Keep the file short and operator-actionable. No prose, no narration.
+
+  5.3. Append to `{{ history_path }}`:
   ```json
   {"ts":"<iso8601>","git_sha":"<sha>","backend_image":"<acr>/<repo>:<sha>",
    "frontend_image":"<acr_fe>/<repo>-fe:<sha-or-null>","env":"{{ env }}",
    "region":"{{ region }}","cloud":"azure","attempts":<N>,"prefixes":<M>,"result":"success"}
   ```
 
-  5.3. **Print the success marker on its own line, IMMEDIATELY after 5.2:**
+  5.4. **Print the success marker on its own line, IMMEDIATELY after 5.3:**
   - Single-service: `APP DEPLOYED image=<acr_login_server>/{{ repo_name }}:<sha>`
   - Multi-service:  `APP DEPLOYED backend=<uri> frontend=<uri>`
 
-  5.4. Cleanup is optional and ALWAYS comes after 5.3.
+  5.5. Cleanup is optional and ALWAYS comes after 5.4.
 
   ## Phase 6 — Total failure (budget exhausted, or unrecoverable)
 

@@ -11,6 +11,14 @@ let activeWS    = null;       // active log WebSocket
 let runningAction = null;     // action string (e.g. "assess") or null
 let runningStartedAt = 0;     // ms epoch
 let runningLastTool = "";     // last tool/section name pulled from log
+let runningTokens   = "";     // formatted token count (e.g. "2.3M") parsed
+                              // from the shell's "    tokens: X.XM (session …)"
+                              // line emitted at end of each goose recipe
+let runningEtaSec    = 0;     // backend-supplied ETA for current run (sec).
+                              // Used to compute progress % = min(95, elapsed/eta).
+let runningEtaSource = "";    // "default" | "historical" — shown in subline so
+                              // operator knows whether the bar is calibrated.
+let runningEtaSamples = 0;    // count of past runs informing the ETA (when historical).
 
 // ─── Workflow steps definition ─────────────────────────────────────
 // Each step describes its prereq (a status flag from state.yaml that must be
@@ -20,7 +28,7 @@ let runningLastTool = "";     // last tool/section name pulled from log
 //  • sets       — state.yaml status flags this step flips to true
 //  • artifact   — path to a file (relative to project root) that exists
 //                 if the step has run; used for steps without state flags
-//                 (review-iac, plan-infra, audit)
+//                 (plan-infra, audit)
 //  • side-only  — no artifact and no flag (e.g. aws-bootstrap which only
 //                 creates an S3 bucket); fall back to in-session memory
 const STEPS = [
@@ -40,12 +48,6 @@ const STEPS = [
     id: "generate-iac",   action: "generate-iac",
     label: "Generate IaC",
     prereq: "selected",   sets: ["iac_generated"],
-  },
-  {
-    id: "review-iac",     action: "review-iac",
-    label: "Review IaC (security/cost)",
-    prereq: "iac_generated", sets: [],
-    artifact: "docs/01_review.md",
   },
   {
     id: "bootstrap",
@@ -101,9 +103,13 @@ function loadLastRunMap() {
   try { return JSON.parse(localStorage.getItem(LAST_RUN_KEY) || "{}"); }
   catch (e) { return {}; }
 }
-function saveLastRun(repo, action, seconds) {
+function saveLastRun(repo, action, seconds, tokens) {
   const map = loadLastRunMap();
-  map[`${repo}:${action}`] = { seconds, at: Date.now() };
+  // tokens is optional — older entries that pre-date the token plumbing
+  // still render correctly because the render path treats undefined as
+  // "don't show". Always overwrite the field so a re-run after a fresh
+  // shell-side fix updates the value (rather than keeping a stale one).
+  map[`${repo}:${action}`] = { seconds, tokens: tokens || null, at: Date.now() };
   try { localStorage.setItem(LAST_RUN_KEY, JSON.stringify(map)); }
   catch (e) { /* quota? ignore */ }
 }
@@ -115,6 +121,18 @@ function fmtSec(s) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s/60)}m${String(s%60).padStart(2,'0')}s`;
   return `${Math.floor(s/3600)}h${String(Math.floor((s%3600)/60)).padStart(2,'0')}m`;
+}
+// Format the live "X% · ~Ym (default|avg of N)" suffix appended to the
+// running-step subline. Returns "" when ETA isn't known yet (fetch in
+// flight or unsupported action) so the basic "elapsed Ns" still renders
+// without a confusing 0%.
+function runningProgressSuffix(elapsedSec) {
+  if (!runningEtaSec || runningEtaSec <= 0) return "";
+  const pct = Math.min(95, Math.floor(elapsedSec * 100 / runningEtaSec));
+  const tag = runningEtaSource === "historical"
+    ? `avg of ${runningEtaSamples}`
+    : "default";
+  return ` · ${pct}% of ~${fmtSec(runningEtaSec)} (${tag})`;
 }
 
 
@@ -614,7 +632,7 @@ function stepIsDone(step, data, cloud) {
   const status = (data.state || {}).status || {};
   // 1. State-flag based (assess, select, generate-iac, apply-infra, deploy-app)
   if (step.sets.length > 0 && step.sets.every(f => status[f])) return true;
-  // 2. Artifact-based (review-iac, plan-infra, audit)
+  // 2. Artifact-based (plan-infra, audit)
   if (step.artifact) {
     const [dir, ...rest] = step.artifact.split("/");
     const fname = rest.join("/");
@@ -658,13 +676,15 @@ function renderSteps(data) {
     let extraSubline = "";
     if (isRunning) {
       const sec = Math.floor((Date.now() - runningStartedAt) / 1000);
-      buttonText = `Running ${sec}s${runningLastTool ? " · " + runningLastTool : ""}`;
+      const pctSuffix = runningProgressSuffix(sec);
+      buttonText = `Running ${sec}s${pctSuffix}${runningLastTool ? " · " + runningLastTool : ""}`;
       extraSubline = `<div class="text-xs text-amber-600 font-mono mt-0.5">▸ ${runningLastTool || "starting…"}</div>`;
     } else {
       // Show duration of last successful run (per project+action), if any.
       const last = currentRepo ? getLastRun(currentRepo, action) : null;
       if (last) {
-        extraSubline = `<div class="text-xs text-slate-400 font-mono mt-0.5">last run: ${fmtSec(last.seconds)}</div>`;
+        const tokenSuffix = last.tokens ? ` · ${last.tokens} tokens` : "";
+        extraSubline = `<div class="text-xs text-slate-400 font-mono mt-0.5">last run: ${fmtSec(last.seconds)}${tokenSuffix}</div>`;
       }
     }
     // Disabled if locked, or if some OTHER recipe is currently running
@@ -696,7 +716,8 @@ function tickRunningStepRow() {
     const btn = row.querySelector("button");
     if (!btn || btn.dataset.action !== runningAction) return;
     const sec = Math.floor((Date.now() - runningStartedAt) / 1000);
-    btn.textContent = `Running ${sec}s${runningLastTool ? " · " + runningLastTool : ""}`;
+    const pctSuffix = runningProgressSuffix(sec);
+    btn.textContent = `Running ${sec}s${pctSuffix}${runningLastTool ? " · " + runningLastTool : ""}`;
     const sub = row.querySelector(".text-amber-600");
     if (sub) sub.textContent = `▸ ${runningLastTool || "starting…"}`;
   });
@@ -798,12 +819,7 @@ function renderDangerZone(data) {
   } else {
     btn.disabled = false;
     btn.classList.remove("opacity-40", "cursor-not-allowed");
-    if (!status.infra_deployed) {
-      reason.textContent = "No successful apply recorded — destroy will still run terragrunt against any state present (use this after a partial/failed apply).";
-      reason.classList.remove("hidden");
-    } else {
-      reason.classList.add("hidden");
-    }
+    reason.classList.add("hidden");
   }
 }
 
@@ -879,9 +895,26 @@ async function runActionWS(action, payload, onDone) {
   }
 
   // ── set up running-state markers used by renderSteps + tick
-  runningAction    = action;
-  runningStartedAt = Date.now();
-  runningLastTool  = "";
+  runningAction     = action;
+  runningStartedAt  = Date.now();
+  runningLastTool   = "";
+  runningTokens     = "";
+  runningEtaSec     = 0;
+  runningEtaSource  = "";
+  runningEtaSamples = 0;
+
+  // Fetch ETA in the background so the progress bar can render as soon as
+  // it arrives. Don't block UI on this — if the endpoint is slow or 404s
+  // (unknown action), tick falls back to "elapsed Ns" without %.
+  fetch(`/api/eta/${encodeURIComponent(action)}`)
+    .then(r => r.ok ? r.json() : null)
+    .then(eta => {
+      if (!eta || runningAction !== action) return; // run already finished
+      runningEtaSec     = eta.eta_seconds || 0;
+      runningEtaSource  = eta.source || "";
+      runningEtaSamples = eta.samples || 0;
+    })
+    .catch(() => { /* silently fall back to no-% display */ });
 
   // Re-render steps so the just-clicked row goes to "running" badge + the
   // others get disabled. Falls back gracefully if there's no current data.
@@ -898,8 +931,9 @@ async function runActionWS(action, payload, onDone) {
   // 1-second tick: updates the inline log hint AND the step-row button text
   const tick = setInterval(() => {
     const sec = Math.floor((Date.now() - runningStartedAt) / 1000);
+    const pctSuffix = runningProgressSuffix(sec);
     const hint = $("#log-running-hint");
-    if (hint) hint.textContent = `▸ running ${action} (${sec}s elapsed)${runningLastTool ? " · " + runningLastTool : ""}…`;
+    if (hint) hint.textContent = `▸ running ${action} (${sec}s elapsed${pctSuffix})${runningLastTool ? " · " + runningLastTool : ""}…`;
     tickRunningStepRow();
   }, 1000);
 
@@ -921,6 +955,17 @@ async function runActionWS(action, payload, onDone) {
         runningLastTool = toolMatch[1].trim();
         tickRunningStepRow();
       }
+      // Capture token count from the shell's _print_token_usage line:
+      //   "    tokens: 2.3M (session 20260507_2)"
+      // This line is emitted by `run_recipe` after every goose recipe
+      // (success or failure). Save the latest match so multi-recipe
+      // commands (e.g. plan-infra → apply-infra chained) end up with the
+      // most recent recipe's tokens — matches what the user sees in the
+      // log tail.
+      const tokMatch = msg.data.match(/tokens:\s+([\d.]+[KM]?)\s+\(session/);
+      if (tokMatch) {
+        runningTokens = tokMatch[1];
+      }
     }
     else if (msg.type === "exit") {
       line.textContent = `▸ exit code: ${msg.code} (took ${Math.floor((Date.now() - runningStartedAt) / 1000)}s)`;
@@ -932,11 +977,15 @@ async function runActionWS(action, payload, onDone) {
       const elapsedSec = Math.floor((Date.now() - runningStartedAt) / 1000);
       if (msg.code === 0) {
         sessionCompletedActions.add(action);
-        if (currentRepo) saveLastRun(currentRepo, action, elapsedSec);
+        if (currentRepo) saveLastRun(currentRepo, action, elapsedSec, runningTokens);
       }
       // Clear running state BEFORE refreshProject so steps render fresh.
       runningAction = null;
       runningLastTool = "";
+      runningTokens = "";
+      runningEtaSec = 0;
+      runningEtaSource = "";
+      runningEtaSamples = 0;
       if (typeof onDone === "function") onDone();
     }
     else if (msg.type === "error") { line.textContent = `error: ${msg.msg}`; line.className += " err"; }

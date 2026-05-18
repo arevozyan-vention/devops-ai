@@ -20,11 +20,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ── system packages ─────────────────────────────────────────────────
 # openssl: deploy-app self-heal generates JWT/APP secrets via
 #   `openssl rand -hex 32` when an app reports "<VAR>_SECRET is required".
+# sqlite3: `_print_token_usage` in devops-ai.sh queries goose's session
+#   database (~/.local/share/goose/sessions/sessions.db) after each recipe
+#   to print the token count. Goose embeds rusqlite for its own writes and
+#   doesn't need the CLI, but our shell-side reader does.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget gnupg lsb-release unzip \
       python3 python3-pip python3-venv \
       git jq make build-essential \
       bash openssh-client openssl \
+      sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── yq (mikefarah) ──────────────────────────────────────────────────
@@ -75,8 +80,8 @@ RUN curl -fsSL https://aka.ms/InstallAzureCLIDeb | bash && \
 # current stable line.
 # Terragrunt 1.0+ matches the `terragrunt run --all <cmd>` syntax used in
 # the framework's recipes (older 0.x used `run-all`).
-ARG TF_VERSION=1.14.9
-ARG TG_VERSION=1.0.3
+ARG TF_VERSION=1.15.2
+ARG TG_VERSION=1.0.4
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_${ARCH}.zip" -o /tmp/tf.zip && \
     unzip -q /tmp/tf.zip -d /usr/local/bin && rm /tmp/tf.zip && \
@@ -99,10 +104,16 @@ RUN ARCH=$(dpkg --print-architecture) && \
 #      cache is already populated when the image starts. First plan-infra
 #      on a fresh container goes from ~10 min to ~2 min.
 #
-# Versions match the constraints in:
-#   - templates/iac/ecs-fargate-rds/environments/root.hcl  (aws ~> 5.70)
+# Versions are EXACT pins and MUST match every skeleton's
+# environments/root.hcl required_providers block. Drift between this
+# prebake and a project's `.terraform.lock.hcl` (which records exact
+# versions resolved at first init) causes apply to fail with
+# "no package for <provider> X.Y.Z cached". Whenever you bump a version
+# here, bump it identically in:
+#   - templates/iac/ecs-fargate-rds/environments/root.hcl
 #   - templates/iac/container-apps-postgres/environments/root.hcl
-#     (azurerm ~> 4.10, azapi ~> 2.2, random ~> 3.6, tls ~> 4.0)
+# and any active project's iac/environments/root.hcl that you want to
+# stay compatible with the new image.
 ENV TF_PLUGIN_CACHE_DIR=/root/.terraform.d/plugin-cache \
     TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true
 RUN mkdir -p "$TF_PLUGIN_CACHE_DIR" && \
@@ -116,11 +127,11 @@ RUN mkdir -p /tmp/tf-prebake && \
       'terraform {' \
       '  required_version = ">= 1.6.0"' \
       '  required_providers {' \
-      '    random  = { source = "hashicorp/random",  version = "~> 3.6"  }' \
-      '    tls     = { source = "hashicorp/tls",     version = "~> 4.0"  }' \
-      '    aws     = { source = "hashicorp/aws",     version = "~> 5.70" }' \
-      '    azurerm = { source = "hashicorp/azurerm", version = "~> 4.10" }' \
-      '    azapi   = { source = "Azure/azapi",       version = "~> 2.2"  }' \
+      '    random  = { source = "hashicorp/random",  version = "= 3.8.1"   }' \
+      '    tls     = { source = "hashicorp/tls",     version = "= 4.2.1"   }' \
+      '    aws     = { source = "hashicorp/aws",     version = "= 5.100.0" }' \
+      '    azurerm = { source = "hashicorp/azurerm", version = "= 4.72.0"  }' \
+      '    azapi   = { source = "Azure/azapi",       version = "= 2.9.0"   }' \
       '  }' \
       '}' \
       > /tmp/tf-prebake/main.tf && \
