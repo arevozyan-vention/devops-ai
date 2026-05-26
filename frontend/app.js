@@ -370,6 +370,185 @@ $("#anthropic-key-clear").addEventListener("click", async () => {
 });
 
 
+// ─── LLM provider toggle + Local LLM form ──────────────────────────
+// Two providers can be configured at any time; only one is active in goose.
+// /api/llm/status reports which kind is active and what's configured.
+
+function _llmResult(msg, kind) {
+  // kind: "ok" | "err" | "info"
+  const el = $("#local-llm-result");
+  if (!el) return;
+  el.className = "mt-3 text-xs " + (
+    kind === "ok"  ? "text-emerald-700" :
+    kind === "err" ? "text-red-700"    :
+                     "text-slate-600"
+  );
+  el.textContent = msg;
+}
+
+async function refreshLlmStatus() {
+  // Drive the top toggle bar and the Local LLM form's saved state.
+  let status, local;
+  try {
+    status = await fetch("/api/llm/status").then(r => r.json());
+  } catch (e) { return; }
+  try {
+    local = await fetch("/api/llm/local/status").then(r => r.json());
+  } catch (e) { local = { configured: false, is_active: false, config: null }; }
+
+  const bar = $("#llm-provider-status");
+  if (bar) {
+    if (status.active_kind === "anthropic") {
+      bar.innerHTML = `<span class="text-emerald-700">● Anthropic active</span>
+        <span class="text-slate-400">(${status.active_provider})</span>`;
+    } else if (status.active_kind === "local") {
+      bar.innerHTML = `<span class="text-emerald-700">● Local LLM active</span>
+        <span class="text-slate-400">(${status.active_provider})</span>`;
+    } else {
+      bar.innerHTML = `<span class="text-amber-600">○ No provider configured</span>`;
+    }
+  }
+
+  // Pre-populate the form with last-saved config so the operator can tweak
+  // and re-save without re-typing the endpoint.
+  const cfg = local.config;
+  if (cfg) {
+    const form = $("#local-llm-form");
+    if (form) {
+      form.elements["provider_type"].value = cfg.provider_type;
+      form.elements["endpoint_url"].value  = cfg.endpoint_url;
+      form.elements["verify_tls"].checked  = cfg.verify_tls;
+      // Show the saved model name in the dropdown without re-detecting.
+      const sel = $("#local-llm-model");
+      if (sel && cfg.model_name) {
+        sel.innerHTML = `<option value="${cfg.model_name}">${cfg.model_name} (saved)</option>`;
+        sel.disabled = false;
+      }
+    }
+  }
+}
+
+// "Detect models" — probe the endpoint, populate the model dropdown.
+$("#local-llm-detect")?.addEventListener("click", async () => {
+  const form = $("#local-llm-form");
+  const data = Object.fromEntries(new FormData(form).entries());
+  data.verify_tls = form.elements["verify_tls"].checked;
+  // model_name not needed for test — drop it
+  delete data.model_name;
+  if (!data.endpoint_url) { _llmResult("Endpoint URL is required", "err"); return; }
+
+  _llmResult("Probing endpoint…", "info");
+  try {
+    const r = await fetch("/api/llm/local/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }).then(r => r.json());
+
+    if (!r.ok) {
+      _llmResult(`✗ ${r.error || "connection failed"}`, "err");
+      return;
+    }
+    const sel = $("#local-llm-model");
+    sel.disabled = false;
+    if (!r.models.length) {
+      sel.innerHTML = `<option value="">— no models found on the server —</option>`;
+      _llmResult("Connected, but the server reports zero models. Pull/serve a model first.", "err");
+      return;
+    }
+    sel.innerHTML = r.models
+      .map(m => `<option value="${m}">${m}</option>`)
+      .join("");
+    _llmResult(`✓ Connected — ${r.models.length} model(s) available`, "ok");
+  } catch (e) {
+    _llmResult(`✗ ${e.message || "network error"}`, "err");
+  }
+});
+
+// Helper used by both "Save" and "Save & Activate" — gathers, posts, returns result.
+async function _saveLocalLlm() {
+  const form = $("#local-llm-form");
+  const data = Object.fromEntries(new FormData(form).entries());
+  data.verify_tls = form.elements["verify_tls"].checked;
+  if (!data.model_name) {
+    _llmResult("Pick a model first (click 'Detect models' to populate the list)", "err");
+    return null;
+  }
+  if (!data.api_key) delete data.api_key;
+  try {
+    const r = await fetch("/api/llm/local/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: "save failed" }));
+      _llmResult(`✗ ${err.detail || "save failed"}`, "err");
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    _llmResult(`✗ ${e.message || "network error"}`, "err");
+    return null;
+  }
+}
+
+// "Save" — persist without switching provider.
+$("#local-llm-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const r = await _saveLocalLlm();
+  if (r?.ok) {
+    _llmResult("✓ Saved. Click 'Use Local LLM' above to activate.", "ok");
+    refreshLlmStatus();
+  }
+});
+
+// "Save & Activate" — save + flip goose to this provider in one click.
+$("#local-llm-activate-after-save")?.addEventListener("click", async () => {
+  const saveRes = await _saveLocalLlm();
+  if (!saveRes?.ok) return;
+  try {
+    const r = await fetch("/api/llm/local/activate", { method: "POST" })
+      .then(r => r.json());
+    if (r.ok) {
+      _llmResult(`✓ Saved and activated. goose provider: ${r.active_provider} · model: ${r.model}`, "ok");
+    } else {
+      _llmResult(`✗ ${r.detail || "activate failed"}`, "err");
+    }
+  } catch (e) {
+    _llmResult(`✗ ${e.message || "network error"}`, "err");
+  }
+  refreshLlmStatus();
+});
+
+// Top-bar "Use Anthropic" / "Use Local LLM" — switch active provider.
+$("#llm-activate-anthropic")?.addEventListener("click", async () => {
+  try {
+    const r = await fetch("/api/llm/anthropic/activate", { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: "activate failed" }));
+      alert(err.detail || "Could not activate Anthropic");
+    }
+  } catch (e) { alert(e.message); }
+  refreshLlmStatus();
+  refreshAuth();
+});
+
+$("#llm-activate-local")?.addEventListener("click", async () => {
+  try {
+    const r = await fetch("/api/llm/local/activate", { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: "activate failed" }));
+      alert(err.detail || "Could not activate Local LLM (configure and Save first)");
+    }
+  } catch (e) { alert(e.message); }
+  refreshLlmStatus();
+  refreshAuth();
+});
+
+// Refresh provider status on page load + every time user opens Setup tab.
+refreshLlmStatus();
+
 
 // ─── AWS credentials form ──────────────────────────────────────────
 $("#aws-form").addEventListener("submit", async (e) => {

@@ -149,7 +149,37 @@ _recipe_for_cloud() {
 # success-marker rules consistently and finds source mismatches Sonnet
 # misses. Override globally with RECIPE_MODEL_OVERRIDE=<model> for
 # experimentation.
+
+# Read the active goose provider. Env wins over config because goose itself
+# resolves env first — if backend/uvicorn was started with GOOSE_PROVIDER=ollama
+# (e.g. after /api/llm/local/activate set it in the process env), goose sees
+# ollama regardless of what the file says. Reading env first keeps shell-side
+# decisions (whether to pass --model override) consistent with what goose
+# actually does. Empty string only if neither source is set.
+_active_goose_provider() {
+  if [[ -n "${GOOSE_PROVIDER:-}" ]]; then
+    echo "$GOOSE_PROVIDER"
+    return
+  fi
+  local cfg="$HOME/.config/goose/config.yaml"
+  [[ -f "$cfg" ]] || { echo ""; return; }
+  grep -m1 '^GOOSE_PROVIDER:' "$cfg" 2>/dev/null \
+    | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}'
+}
+
 _recipe_model() {
+  # When the operator activated a Local LLM (ollama / openai-compat) via
+  # the Setup tab, we MUST NOT pass --model claude-opus-4-7 to goose —
+  # the local backend has no such model and the recipe will fail with
+  # "model not found". Returning empty here drops the --model flag so
+  # goose uses GOOSE_MODEL from its config (the local model the operator
+  # picked). Per-recipe Opus mapping only applies on Anthropic.
+  local provider; provider="$(_active_goose_provider)"
+  case "$provider" in
+    claude-acp|anthropic|"") ;;     # fall through to per-recipe mapping
+    *)                       echo ""; return ;;  # local provider: no override
+  esac
+
   case "$1" in
     analyze|recommend|assess|generate-iac|infra-plan|\
     infra-apply|deploy-app|upgrade|rollback|audit)

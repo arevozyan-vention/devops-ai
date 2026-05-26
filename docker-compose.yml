@@ -21,6 +21,12 @@ services:
       - ${HOME}/.claude:/root/.claude
       # AWS credentials — UI can also overwrite via the Setup tab
       - ${HOME}/.aws:/root/.aws
+      # devops-ai per-host config (Local LLM endpoint, model, optional API key).
+      # Survives container rebuild so the operator's local-LLM setup sticks.
+      - ${HOME}/.config/devops-ai:/root/.config/devops-ai
+      # Goose config (provider + model). Mounted RW so /api/llm/*/activate
+      # writes persist across container restarts.
+      - ${HOME}/.config/goose:/root/.config/goose
       # Persistent project state outside the image (state.yaml, generated
       # iac/, deploy outputs). Survives container rebuild.
       - ./projects:/workspace/projects

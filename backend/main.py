@@ -801,14 +801,28 @@ def _bashrc_set_env(name: str, value: Optional[str]) -> None:
 
 
 def _set_goose_provider(provider: str, model: str = "claude-opus-4-7") -> None:
-    """Rewrite GOOSE_PROVIDER/GOOSE_MODEL in ~/.config/goose/config.yaml."""
+    """Rewrite GOOSE_PROVIDER/GOOSE_MODEL in ~/.config/goose/config.yaml AND
+    update the process env so spawned goose subprocesses see the new values
+    immediately. Also strips any Local-LLM-specific keys (OLLAMA_HOST,
+    OPENAI_BASE_URL, OPENAI_API_KEY) so a half-switched state can't make
+    goose pick a wrong combination (e.g. provider=anthropic + model from
+    OPENAI_BASE_URL endpoint, or stale env var from a previous activation)."""
     cfg = Path.home() / ".config" / "goose" / "config.yaml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     text = cfg.read_text() if cfg.exists() else ""
     lines = text.splitlines()
-    keep = [ln for ln in lines if not ln.startswith(("GOOSE_PROVIDER:", "GOOSE_MODEL:"))]
+    drop = ("GOOSE_PROVIDER:", "GOOSE_MODEL:",
+            "OLLAMA_HOST:", "OPENAI_BASE_URL:", "OPENAI_HOST:", "OPENAI_API_KEY:")
+    keep = [ln for ln in lines if not ln.startswith(drop)]
     new = [f"GOOSE_PROVIDER: {provider}", f"GOOSE_MODEL: {model}"] + keep
     cfg.write_text("\n".join(new) + "\n")
+
+    # Sync process env so the very next recipe run uses the right values
+    # without waiting for the backend to restart and re-read config.
+    os.environ["GOOSE_PROVIDER"] = provider
+    os.environ["GOOSE_MODEL"] = model
+    for stale in ("OLLAMA_HOST", "OPENAI_BASE_URL", "OPENAI_HOST", "OPENAI_API_KEY"):
+        os.environ.pop(stale, None)
 
 
 @app.post("/api/anthropic/use-subscription")
@@ -850,8 +864,17 @@ def auth_status() -> dict:
     """
     state = current_auth()
     has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if (state.get("subscription_works")
-            and state.get("current_provider") != "claude-acp"
+    current = state.get("current_provider", "")
+    # IMPORTANT: never auto-switch if the operator has activated a Local LLM
+    # provider. The auto-heal below was designed to recover the baked-default
+    # "anthropic" path after image rebuilds — it must NOT clobber an explicit
+    # user choice to use ollama / openai-compat (which we'd otherwise undo
+    # every time the Setup tab polls /api/anthropic/status).
+    local_active = current in ("ollama", "openai")
+
+    if (not local_active
+            and state.get("subscription_works")
+            and current != "claude-acp"
             and not has_key):
         try:
             _set_goose_provider("claude-acp")
@@ -859,9 +882,10 @@ def auth_status() -> dict:
             state["auto_switched"] = True
         except Exception:
             pass
-    elif (has_key
+    elif (not local_active
+            and has_key
             and state.get("api_key_works")
-            and state.get("current_provider") != "anthropic"):
+            and current != "anthropic"):
         try:
             _set_goose_provider("anthropic")
             state["current_provider"] = "anthropic"
@@ -1235,6 +1259,285 @@ def get_auth_mode() -> dict:
         "auth_mode": mode,
         "has_api_key": has_key,
         "claude_authenticated": claude_ok,
+    }
+
+
+# ─── Local LLM provider (Ollama / OpenAI-compatible / llama.cpp) ─────
+#
+# Adds a second authentication option alongside Anthropic. Operator can flip
+# between providers at any time via /api/llm/activate. The existing
+# Anthropic flow is untouched — we just add a parallel path.
+#
+# Persistence: ~/.config/devops-ai/llm.yaml stores the local LLM config
+# (provider type, endpoint, model, optional API key). The active provider
+# is implicit in the goose config (~/.config/goose/config.yaml).
+#
+# Discovery uses each provider's documented model-list endpoint:
+#   - Ollama:          GET {endpoint}/api/tags
+#   - OpenAI-compat:   GET {endpoint}/v1/models  (with Bearer auth if key given)
+#   - llama.cpp:       same as OpenAI-compat
+
+LOCAL_LLM_CONFIG_PATH = Path.home() / ".config" / "devops-ai" / "llm.yaml"
+
+# Provider types the UI exposes. Internally mapped to a goose provider name.
+LOCAL_LLM_PROVIDER_TYPES = ("ollama", "openai-compat", "llamacpp")
+
+
+class LocalLlmConfig(BaseModel):
+    """Local LLM provider config. `api_key` is optional — Ollama and a
+    self-hosted llama.cpp typically don't require one; vLLM/LM Studio with
+    auth enabled do. `verify_tls` defaults to True for safety; flip to
+    False for self-signed certificates on LAN."""
+    provider_type: str  # one of LOCAL_LLM_PROVIDER_TYPES
+    endpoint_url: str   # e.g. http://192.168.1.5:11434 or http://server:8000/v1
+    model_name: str = ""
+    api_key: Optional[str] = None
+    verify_tls: bool = True
+
+
+def _read_local_llm_config() -> Optional[LocalLlmConfig]:
+    """Return the saved Local LLM config, or None if not configured yet."""
+    if not LOCAL_LLM_CONFIG_PATH.exists():
+        return None
+    try:
+        raw = yaml.safe_load(LOCAL_LLM_CONFIG_PATH.read_text()) or {}
+        return LocalLlmConfig(**raw)
+    except Exception:
+        return None
+
+
+def _save_local_llm_config(cfg: LocalLlmConfig) -> None:
+    LOCAL_LLM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOCAL_LLM_CONFIG_PATH.write_text(yaml.safe_dump(cfg.model_dump()))
+    os.chmod(LOCAL_LLM_CONFIG_PATH, 0o600)
+
+
+def _discover_local_models(cfg: LocalLlmConfig, timeout: float = 5.0) -> dict:
+    """Call the provider's model-list endpoint and return a normalized response.
+    Always returns {ok: bool, models: [str], error: str|None}."""
+    import ssl
+    headers = {}
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    base = cfg.endpoint_url.rstrip("/")
+    if cfg.provider_type == "ollama":
+        url = f"{base}/api/tags"
+    else:
+        # OpenAI-compat / llama.cpp — both expose /v1/models. If the user
+        # already included /v1 in their URL, don't double it.
+        if base.endswith("/v1"):
+            url = f"{base}/models"
+        else:
+            url = f"{base}/v1/models"
+
+    ctx = ssl.create_default_context()
+    if not cfg.verify_tls:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            body = r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "models": [], "error": f"HTTP {e.code}: {e.reason}"}
+    except urllib.error.URLError as e:
+        return {"ok": False, "models": [], "error": f"connection failed: {e.reason}"}
+    except Exception as e:
+        return {"ok": False, "models": [], "error": str(e)}
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        return {"ok": False, "models": [], "error": "response was not valid JSON"}
+
+    # Normalize to a flat list of model names regardless of provider shape.
+    models: list[str] = []
+    if cfg.provider_type == "ollama":
+        # Ollama: {"models": [{"name": "qwen2.5-coder:32b", "size": 1234, ...}]}
+        for m in data.get("models", []) or []:
+            name = m.get("name") or m.get("model")
+            if name:
+                models.append(name)
+    else:
+        # OpenAI-compat: {"data": [{"id": "gpt-4", ...}]}
+        for m in data.get("data", []) or []:
+            mid = m.get("id")
+            if mid:
+                models.append(mid)
+
+    return {"ok": True, "models": sorted(models), "error": None}
+
+
+def _set_goose_provider_local(cfg: LocalLlmConfig) -> None:
+    """Rewrite ~/.config/goose/config.yaml to point at the local LLM.
+    Preserves any pre-existing extension blocks. The provider name in goose
+    differs from our UI provider_type: ollama→ollama, the rest→openai
+    (goose's `openai` provider speaks OpenAI-compat protocol with a custom
+    base URL)."""
+    if cfg.provider_type == "ollama":
+        goose_provider = "ollama"
+    else:
+        goose_provider = "openai"
+
+    cfg_path = Path.home() / ".config" / "goose" / "config.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    text = cfg_path.read_text() if cfg_path.exists() else ""
+    lines = text.splitlines()
+
+    # Drop any prior provider/model/endpoint/key lines — we rewrite them.
+    drop_prefixes = (
+        "GOOSE_PROVIDER:", "GOOSE_MODEL:",
+        "OLLAMA_HOST:", "OLLAMA_HOST=",
+        "OPENAI_BASE_URL:", "OPENAI_HOST:", "OPENAI_API_KEY:",
+    )
+    keep = [ln for ln in lines if not ln.startswith(drop_prefixes)]
+
+    new_lines = [f"GOOSE_PROVIDER: {goose_provider}", f"GOOSE_MODEL: {cfg.model_name}"]
+    if cfg.provider_type == "ollama":
+        # Goose's ollama provider reads OLLAMA_HOST. Strip trailing /api or /v1.
+        host = cfg.endpoint_url.rstrip("/")
+        for suffix in ("/api", "/v1"):
+            if host.endswith(suffix):
+                host = host[: -len(suffix)]
+        new_lines.append(f"OLLAMA_HOST: {host}")
+    else:
+        # OpenAI-compatible: base URL must end with /v1 for goose.
+        base = cfg.endpoint_url.rstrip("/")
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        new_lines.append(f"OPENAI_BASE_URL: {base}")
+        if cfg.api_key:
+            new_lines.append(f"OPENAI_API_KEY: {cfg.api_key}")
+
+    cfg_path.write_text("\n".join(new_lines + keep) + "\n")
+
+    # Also export to current process env so an immediately-started recipe
+    # picks the new provider without waiting for a re-read of config.
+    os.environ["GOOSE_PROVIDER"] = goose_provider
+    os.environ["GOOSE_MODEL"] = cfg.model_name
+    if cfg.provider_type == "ollama":
+        os.environ["OLLAMA_HOST"] = host
+    else:
+        os.environ["OPENAI_BASE_URL"] = base
+        if cfg.api_key:
+            os.environ["OPENAI_API_KEY"] = cfg.api_key
+
+
+@app.get("/api/llm/local/status")
+def local_llm_status() -> dict:
+    """Return saved Local LLM config (api_key redacted) and whether it is
+    currently the active goose provider."""
+    cfg = _read_local_llm_config()
+    active_provider = ""
+    cfg_path = Path.home() / ".config" / "goose" / "config.yaml"
+    if cfg_path.exists():
+        for line in cfg_path.read_text().splitlines():
+            if line.startswith("GOOSE_PROVIDER:"):
+                active_provider = line.split(":", 1)[1].strip()
+                break
+
+    is_active = bool(cfg) and active_provider in ("ollama", "openai")
+    return {
+        "configured": cfg is not None,
+        "is_active": is_active,
+        "active_provider": active_provider,
+        "config": (
+            None if cfg is None
+            else {
+                "provider_type": cfg.provider_type,
+                "endpoint_url": cfg.endpoint_url,
+                "model_name": cfg.model_name,
+                "has_api_key": bool(cfg.api_key),
+                "verify_tls": cfg.verify_tls,
+            }
+        ),
+    }
+
+
+@app.post("/api/llm/local/test")
+def local_llm_test(req: LocalLlmConfig) -> dict:
+    """Ping the endpoint, list available models. Does NOT persist or
+    activate — pure read-only probe so the UI can populate a model dropdown
+    before the operator commits."""
+    if req.provider_type not in LOCAL_LLM_PROVIDER_TYPES:
+        raise HTTPException(400, f"provider_type must be one of {LOCAL_LLM_PROVIDER_TYPES}")
+    return _discover_local_models(req)
+
+
+@app.post("/api/llm/local/save")
+def local_llm_save(req: LocalLlmConfig) -> dict:
+    """Persist the Local LLM config to disk. Does NOT switch the active
+    provider — that's a separate /activate call so the operator can save
+    a config without committing to it."""
+    if req.provider_type not in LOCAL_LLM_PROVIDER_TYPES:
+        raise HTTPException(400, f"provider_type must be one of {LOCAL_LLM_PROVIDER_TYPES}")
+    if not req.model_name:
+        raise HTTPException(400, "model_name is required — pick one from the discovered list")
+    _save_local_llm_config(req)
+    return {"ok": True}
+
+
+@app.post("/api/llm/local/activate")
+def local_llm_activate() -> dict:
+    """Switch the goose provider to the saved Local LLM config. Anthropic
+    creds remain untouched — operator can switch back via
+    /api/llm/anthropic/activate."""
+    cfg = _read_local_llm_config()
+    if cfg is None:
+        raise HTTPException(400, "no local LLM config saved — call /api/llm/local/save first")
+    _set_goose_provider_local(cfg)
+    return {
+        "ok": True,
+        "active_provider": "ollama" if cfg.provider_type == "ollama" else "openai",
+        "model": cfg.model_name,
+    }
+
+
+@app.post("/api/llm/anthropic/activate")
+def anthropic_activate() -> dict:
+    """Switch the goose provider back to Anthropic. Uses subscription
+    (claude-acp) if available, otherwise the API key path. Mirror of
+    /api/llm/local/activate so the UI has a symmetric API."""
+    if subscription_works():
+        _set_goose_provider("claude-acp")
+        return {"ok": True, "active_provider": "claude-acp", "auth_mode": "subscription"}
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        _set_goose_provider("anthropic")
+        return {"ok": True, "active_provider": "anthropic", "auth_mode": "api_key"}
+    raise HTTPException(
+        400,
+        "No Anthropic auth available. Set up subscription OAuth or paste an API key first.",
+    )
+
+
+@app.get("/api/llm/status")
+def llm_status() -> dict:
+    """Unified status: which provider is active, plus what's configured on
+    each side. Used by the UI to render the active-provider toggle and the
+    per-provider blocks."""
+    cfg_path = Path.home() / ".config" / "goose" / "config.yaml"
+    active = ""
+    if cfg_path.exists():
+        for line in cfg_path.read_text().splitlines():
+            if line.startswith("GOOSE_PROVIDER:"):
+                active = line.split(":", 1)[1].strip()
+                break
+
+    if active in ("claude-acp", "anthropic"):
+        active_kind = "anthropic"
+    elif active in ("ollama", "openai"):
+        active_kind = "local"
+    else:
+        active_kind = "none"
+
+    local = _read_local_llm_config()
+    return {
+        "active_kind": active_kind,
+        "active_provider": active,
+        "anthropic_configured": claude_authenticated(),
+        "local_configured": local is not None,
     }
 
 

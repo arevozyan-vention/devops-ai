@@ -31,6 +31,26 @@
 
   <!-- ──────────────  SETUP TAB  ────────────── -->
   <section data-pane="setup" class="hidden">
+
+    <!-- ─── Active LLM provider toggle (spans full width) ─────────── -->
+    <div id="llm-provider-bar"
+         class="bg-white p-4 rounded-lg shadow-sm border mb-6 flex items-center justify-between">
+      <div>
+        <h2 class="font-semibold text-sm mb-1">Active LLM provider</h2>
+        <p id="llm-provider-status" class="text-xs text-slate-500">Loading…</p>
+      </div>
+      <div class="flex gap-2 text-sm">
+        <button id="llm-activate-anthropic"
+                class="bg-slate-200 hover:bg-slate-300 px-3 py-1.5 rounded">
+          Use Anthropic
+        </button>
+        <button id="llm-activate-local"
+                class="bg-slate-200 hover:bg-slate-300 px-3 py-1.5 rounded">
+          Use Local LLM
+        </button>
+      </div>
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
       <!-- AWS creds -->
       <div class="bg-white p-5 rounded-lg shadow-sm border">
@@ -154,6 +174,74 @@
 
         </div>
       </div>
+
+      <!-- ─── Local LLM (Ollama / OpenAI-compat / llama.cpp) ────── -->
+      <div class="bg-white p-5 rounded-lg shadow-sm border md:col-span-2">
+        <h2 class="font-semibold mb-1">Local LLM</h2>
+        <p class="text-xs text-slate-500 mb-3">
+          Point at your own server running Ollama, vLLM, LM Studio, llama.cpp,
+          Groq, Together, or any OpenAI-compatible endpoint. Quality varies
+          with model size; recipes work but self-heal may need more attempts.
+        </p>
+
+        <form id="local-llm-form" class="space-y-3">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <label class="text-sm">
+              Provider type
+              <select name="provider_type"
+                      class="w-full border rounded px-3 py-2 text-sm mt-1">
+                <option value="ollama">Ollama</option>
+                <option value="openai-compat">OpenAI-compatible (vLLM / LM Studio / Groq / Together)</option>
+                <option value="llamacpp">llama.cpp server</option>
+              </select>
+            </label>
+            <label class="text-sm md:col-span-2">
+              Endpoint URL
+              <input name="endpoint_url" required
+                     placeholder="http://192.168.1.5:11434  or  http://server:8000/v1"
+                     class="w-full border rounded px-3 py-2 text-sm font-mono mt-1">
+            </label>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label class="text-sm">
+              API key (optional)
+              <input name="api_key" type="password" autocomplete="off"
+                     placeholder="leave empty for Ollama / open llama.cpp"
+                     class="w-full border rounded px-3 py-2 text-sm font-mono mt-1">
+            </label>
+            <label class="text-sm flex items-end gap-2 pb-1">
+              <input name="verify_tls" type="checkbox" checked class="mr-1">
+              Verify TLS certificate (uncheck for self-signed)
+            </label>
+          </div>
+
+          <div class="flex gap-2 items-center">
+            <button id="local-llm-detect" type="button"
+                    class="bg-slate-200 hover:bg-slate-300 px-3 py-2 rounded text-sm">
+              Detect models
+            </button>
+            <select id="local-llm-model" name="model_name" disabled
+                    class="flex-1 border rounded px-3 py-2 text-sm font-mono">
+              <option value="">— click "Detect models" first —</option>
+            </select>
+          </div>
+
+          <div class="flex gap-2">
+            <button id="local-llm-save" type="submit"
+                    class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">
+              Save
+            </button>
+            <button id="local-llm-activate-after-save" type="button"
+                    class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded text-sm">
+              Save &amp; Activate
+            </button>
+          </div>
+        </form>
+
+        <div id="local-llm-result" class="mt-3 text-xs"></div>
+      </div>
+
     </div>
 
     <!-- ─── OAuth WIZARD MODAL (Path A) ─────────────────────────── -->
